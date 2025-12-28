@@ -662,7 +662,7 @@ def generate_emotion_eeg(info, duration=120, emotion='positive'):
 def main():
     """Generate all task-specific EEG datasets."""
 
-    output_dir = Path("C:/Users/Public/Projects/SOLID_EEG/synthetic/task_specific_data")
+    output_dir = Path("/pscratch/sd/t/tylee/SOLID_EEG_RESULT/synthetic_eeg/synthesis_251223_task")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)

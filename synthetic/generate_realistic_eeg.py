@@ -158,43 +158,41 @@ def generate_eog_artifact(n_samples, sfreq, n_blinks=None):
     return eog
 
 
-def generate_emg_artifact(n_samples, sfreq):
+def generate_emg_artifact(n_samples, sfreq, low=20.0, high=200.0):
     """
     Generate muscle artifacts (EMG).
+    High frequency (low~high Hz), random bursts.
 
-    High frequency (20-200Hz), random bursts, especially in temporal/occipital.
-
-    Parameters:
-    -----------
-    n_samples : int
-        Number of samples
-    sfreq : float
-        Sampling frequency (Hz)
-
-    Returns:
-    --------
-    emg : ndarray
-        EMG artifact signal
+    Automatically clips the high cutoff to be below Nyquist.
     """
-    # High-pass filtered noise
     noise = np.random.randn(n_samples)
 
     from scipy.signal import butter, filtfilt
-    # 20-200 Hz bandpass
-    b, a = butter(4, [20 / (sfreq / 2), 200 / (sfreq / 2)], btype='band')
-    emg = filtfilt(b, a, noise)
 
-    # Create burst envelope
-    envelope = np.abs(np.random.randn(n_samples // 100))
+    nyq = sfreq / 2.0
+    # clip high cutoff to < nyq
+    high_clipped = min(high, 0.95 * nyq)
+
+    # if sampling rate too low for desired band, degrade gracefully
+    if low >= high_clipped:
+        # fallback: just high-pass above (nyq * 0.2) or (low/2), whichever is smaller
+        hp = min(max(1.0, nyq * 0.2), 0.95 * nyq)
+        b, a = butter(4, hp / nyq, btype='high')
+        emg = filtfilt(b, a, noise)
+    else:
+        b, a = butter(4, [low / nyq, high_clipped / nyq], btype='band')
+        emg = filtfilt(b, a, noise)
+
+    # burst envelope
+    envelope = np.abs(np.random.randn(max(1, n_samples // 100)))
     envelope = np.repeat(envelope, 100)[:n_samples]
 
-    # Smooth envelope
-    b, a = butter(3, 1 / (sfreq / 2), btype='low')
+    # smooth envelope (<= 1 Hz low-pass)
+    b, a = butter(3, min(1.0, 0.95 * nyq) / nyq, btype='low')
     envelope = filtfilt(b, a, envelope)
-    envelope = np.maximum(envelope - 1, 0)  # Threshold for bursts
+    envelope = np.maximum(envelope - 1, 0)
 
-    emg = emg * envelope * 20  # Moderate amplitude
-
+    emg = emg * envelope * 20  # amplitude in "uV-ish units" before 1e-6 scaling
     return emg
 
 
@@ -458,55 +456,65 @@ def generate_realistic_eeg(output_dir, scenario='realistic', artifact_level='mod
     print("  Creating forward solution...")
     fwd_matrix, source_locs = create_realistic_forward_solution(info, n_sources)
 
-    # Project to sensors
-    eeg_data = fwd_matrix @ sources
+    # Project to sensors (forward-only baseline)
+    eeg_clean = fwd_matrix @ sources  # shape: (n_channels, n_samples)
 
-    # Add artifacts
+    # --- Define Ground Truth (target) ---
+    # Add small measurement noise to GT (keeps it realistic but still "clean")
+    gt_noise_std = 0.5e-6  # adjust if you want; keep smaller than artifacts
+    eeg_gt = eeg_clean + (np.random.randn(*eeg_clean.shape) * gt_noise_std)
+
+    # --- Define Observed (input) ---
     artifact_scales = {'low': 0.3, 'moderate': 1.0, 'high': 2.0}
     scale = artifact_scales.get(artifact_level, 1.0)
 
-    print(f"  Adding artifacts (level: {artifact_level})...")
-    eeg_data_clean = eeg_data.copy()  # Save clean version
-    eeg_data = add_realistic_artifacts(eeg_data * scale, info, sfreq) / scale
+    print(f"  Adding artifacts to OBS (level: {artifact_level}, scale={scale})...")
+    # Add realistic artifacts ONLY to observed signal
+    eeg_obs = add_realistic_artifacts(eeg_gt * scale, info, sfreq) / scale
 
-    # Add background noise (smaller than artifacts)
-    noise = np.random.randn(*eeg_data.shape) * 0.5e-6
-    eeg_data += noise
+    # Optionally: add a tiny extra sensor noise to OBS (often realistic)
+    obs_noise_std = 0.2e-6
+    eeg_obs += (np.random.randn(*eeg_obs.shape) * obs_noise_std)
 
-    # Create Raw object
-    raw = mne.io.RawArray(eeg_data, info)
+    # --- Create Raw objects ---
+    raw_obs = mne.io.RawArray(eeg_obs, info)
+    raw_gt  = mne.io.RawArray(eeg_gt, info)
+    raw_clean = mne.io.RawArray(eeg_clean, info)
 
-    # Mark bad channels
+    # Mark bad channels on OBS only (makes sense for "observed data quality")
     n_bad = np.random.randint(3, 8)
     bad_channels = np.random.choice(ch_names, size=n_bad, replace=False)
-    raw.info['bads'] = bad_channels.tolist()
+    raw_obs.info['bads'] = bad_channels.tolist()
 
-    print(f"  Bad channels: {bad_channels.tolist()}")
+    print(f"  Bad channels (OBS): {bad_channels.tolist()}")
 
-    # Save files
+    # --- Save files (keep your logging style) ---
+    # OBS (what you'd feed as input / corrupted observation)
     fif_file = output_dir / f"realistic_eeg_{scenario}_{artifact_level}_raw.fif"
-    raw.save(fif_file, overwrite=True)
-    print(f"  Saved: {fif_file}")
+    raw_obs.save(fif_file, overwrite=True)
+    print(f"  Saved OBS: {fif_file}")
 
-    # Save ground truth
-    raw_gt = mne.io.RawArray(eeg_data, info)
+    # GT (the dense target you want to reconstruct)
     gt_file = output_dir / f"realistic_eeg_{scenario}_{artifact_level}_groundtruth_raw.fif"
     raw_gt.save(gt_file, overwrite=True)
-    print(f"  Saved ground truth: {gt_file}")
+    print(f"  Saved ground truth (GT): {gt_file}")
 
-    # Save clean (no artifacts) version for comparison
-    raw_clean = mne.io.RawArray(eeg_data_clean, info)
+    # CLEAN (forward-only, no noise/artifacts; for sanity checks)
     clean_file = output_dir / f"realistic_eeg_{scenario}_{artifact_level}_clean_raw.fif"
     raw_clean.save(clean_file, overwrite=True)
-    print(f"  Saved clean: {clean_file}")
+    print(f"  Saved clean (forward-only): {clean_file}")
 
-    return raw
+    # Optional extra logging (helps debugging/evaluation)
+    print(f"  Shapes: clean={eeg_clean.shape}, gt={eeg_gt.shape}, obs={eeg_obs.shape}")
+    print(f"  Noise std: gt_noise={gt_noise_std:.2e}, obs_noise={obs_noise_std:.2e}")
+
+    return raw_obs
 
 
 def main():
     """Generate realistic datasets."""
 
-    output_dir = Path("C:/Users/Public/Projects/SOLID_EEG/synthetic/realistic_data")
+    output_dir = Path("/pscratch/sd/t/tylee/SOLID_EEG_RESULT/synthetic_eeg/synthesis_251222_realistic")
 
     print("=" * 70)
     print("Realistic EEG Data Generation")

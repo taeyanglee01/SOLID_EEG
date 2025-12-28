@@ -346,7 +346,7 @@ def generate_spatial_pattern_dataset(output_dir):
 def main():
     """Main function to generate all synthetic datasets."""
 
-    output_dir = Path("C:/Users/Public/Projects/SOLID_EEG/synthetic_data")
+    output_dir = Path("/pscratch/sd/t/tylee/SOLID_EEG_RESULT/synthetic_eeg")
 
     print("=" * 70)
     print("Synthetic EEG Data Generation for Spatial Interpolation Testing")
