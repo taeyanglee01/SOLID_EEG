@@ -221,7 +221,9 @@ class Physio_1sec_raw_for_SOLID_from_lmdb(Dataset):
             seg_len_sec: int = 1,
             stride_sec: int = 1,
             mean: float = 0.0,
-            std: float = 1.0
+            std: float = 1.0,
+            p1: float = None,
+            p99: float = None
     ):
         random_seed(seed)
         self.seed = seed
@@ -244,10 +246,12 @@ class Physio_1sec_raw_for_SOLID_from_lmdb(Dataset):
         )
 
         if self.train:
-            self._compute_mean_std()
+            self._compute_mean_std(seed=seed)
         else:
             self.mean = float(mean)
             self.std  = float(std)
+            self.p1 = float(p1)
+            self.p99 = float(p99)
 
     def make_segments_by_fold(self, fold, lmdb_keys, maxfold, split_by_sub, seed):
         train_keys, test_keys = train_test_split_by_fold_num(
@@ -318,33 +322,101 @@ class Physio_1sec_raw_for_SOLID_from_lmdb(Dataset):
 
         return seg_list, meta_list
 
-    def _compute_mean_std(self):
+    def _compute_mean_std(self, p_lo=0.1, p_hi=99.9, max_samples=2_000_000, seed=0):
         """
-        Compute mean/std over the entire TRAIN dataset.
-        Uses streaming to avoid memory blow-up.
+        Compute mean/std over the entire TRAIN dataset (streaming),
+        and estimate percentiles (p_lo, p_hi) via random subsampling to avoid memory blow-up.
+
+        Args:
+            p_lo, p_hi: percentiles to compute (e.g., 1.0 and 99.0)
+            max_samples: maximum number of scalar samples kept for percentile estimation
+            seed: random seed for reproducibility
         """
-        print("[PhysioDataset] Computing mean/std from TRAIN set...")
+        print("[PhysioDataset] Computing mean/std (+ percentiles) from TRAIN set...")
 
         total_sum = 0.0
         total_sq  = 0.0
         total_n   = 0
 
+        # --- percentile sampling state ---
+        g = torch.Generator()
+        g.manual_seed(int(seed))
+
+        samples = []          # list of 1D tensors (cpu) to concat at end
+        kept = 0              # number of scalars kept so far
+
+        # helper: take up to 'k' random scalars from a tensor x
+        def _take_random_scalars(x_flat, k):
+            if k <= 0:
+                return None
+            n = x_flat.numel()
+            if n <= k:
+                return x_flat.detach().cpu()
+            idx = torch.randint(0, n, (k,), generator=g, device=x_flat.device)
+            return x_flat[idx].detach().cpu()
+
         for x in self.data:
             # x: (C, L)
             x = x.float()
 
+            # --- mean/std streaming ---
             total_sum += x.sum().item()
             total_sq  += (x ** 2).sum().item()
             total_n   += x.numel()
 
+            # --- percentile subsampling ---
+            # keep roughly up to max_samples scalars across the whole dataset
+            # strategy: per item, keep min(remaining_budget, some_cap) random points
+            if kept < max_samples:
+                remaining = max_samples - kept
+                # cap per sample so one item doesn't dominate (tuneable)
+                per_item_cap = 50_000
+                k = min(remaining, per_item_cap)
+
+                x_flat = x.reshape(-1)
+                picked = _take_random_scalars(x_flat, k)
+                if picked is not None and picked.numel() > 0:
+                    samples.append(picked)
+                    kept += picked.numel()
+
+        # finalize mean/std
         mean = total_sum / total_n
         var  = total_sq / total_n - mean ** 2
-        std  = (var ** 0.5) if var > 0 else 1.0
+        std  = math.sqrt(var) if var > 0 else 1.0
 
         self.mean = float(mean)
         self.std  = float(std)
 
-        print(f"[Train Dataset] mean={self.mean:.6f}, std={self.std:.6f}")
+        # finalize percentiles (approx)
+        if kept == 0:
+            # fallback: degenerate case
+            self.p1 = float(self.mean - 2 * self.std)
+            self.p99 = float(self.mean + 2 * self.std)
+            print("[PhysioDataset] WARNING: no samples collected for percentiles; using mean±2std fallback.")
+            return
+
+        v = torch.cat(samples, dim=0).float()
+
+        # torch.quantile expects q in [0,1]
+        q_lo = float(p_lo) / 100.0
+        q_hi = float(p_hi) / 100.0
+
+        p_lo_val = torch.quantile(v, q_lo).item()
+        p_hi_val = torch.quantile(v, q_hi).item()
+
+        # safety: avoid zero range
+        if abs(p_hi_val - p_lo_val) < 1e-12:
+            p_lo_val = float(self.mean - 2 * self.std)
+            p_hi_val = float(self.mean + 2 * self.std)
+            print("[PhysioDataset] WARNING: percentile range too small; using mean±2std fallback.")
+
+        # store
+        # 관례적으로 p1/p99라고 부르고 싶으면 p_lo=1, p_hi=99로 호출하면 됨
+        self.p1  = float(p_lo_val)
+        self.p99 = float(p_hi_val)
+
+        print(f"[PhysioDataset] mean={self.mean:.6f}, std={self.std:.6f}, "
+            f"p{p_lo:g}={self.p1:.6f}, p{p_hi:g}={self.p99:.6f}, kept={kept}")
 
     def __len__(self):
         return len(self.data)
@@ -416,6 +488,9 @@ class EEGToGridCtx9_1sec(Dataset):
         self.mean = float(getattr(self.base, "mean", 0.0))
         self.std  = float(getattr(self.base, "std",  1.0))
 
+        self.p1 = float(getattr(self.base, "p1", -100))
+        self.p99 = float(getattr(self.base, "p99", 100))
+
         lat = torch.linspace(0, 1, H).unsqueeze(1).repeat(1, W)
         lon = torch.linspace(0, 1, W).unsqueeze(0).repeat(H, 1)
         self.lat_map = lat
@@ -462,8 +537,13 @@ class EEGToGridCtx9_1sec(Dataset):
 
         # (optional) squash to tanh space
         if self.squash:
-            z = (full_grid - self.mean) / (self.std + 1e-6)
-            x0 = torch.tanh(z)
+            # z = (full_grid - self.mean) / (self.std + 1e-6)
+            # x0 = torch.tanh(z)
+            z = (full_grid - self.p1) / (self.p99 - self.p1 + 1e-6)   # [0,1] 근처
+            z = 2*z - 1                                 # [-1,1]
+
+            x0 = z.clamp(-1, 1) # hard clamp
+            x0 = torch.tanh(z) # soft clamp
         else:
             x0 = full_grid/params.data_scaling_factor  # (L,H,W)
 
@@ -490,12 +570,12 @@ class EEGToGridCtx9_1sec(Dataset):
         # ---- cond ----
         
         cond = torch.cat([
-            self.lat_map.unsqueeze(0),            # (1,H,W)
-            self.lon_map.unsqueeze(0),            # (1,H,W)
+            # self.lat_map.unsqueeze(0),            # (1,H,W)
+            # self.lon_map.unsqueeze(0),            # (1,H,W)
             # t_index,                              # (L,H,W)
-            # obs_grid,                             # (L,H,W) # FIXME : 시간축 이거 필요 없을지도? 뺴고 한 번 넣고 한 번 해보자
-            obs_mask_hw.unsqueeze(0),             # (1,H,W)
-        ], dim=0)                                 # (L+3,H,W)
+            obs_grid,                             # (L,H,W) # FIXME : 시간축 이거 필요 없을지도? 뺴고 한 번 넣고 한 번 해보자
+            # obs_mask_hw.unsqueeze(0),             # (1,H,W)
+        ], dim=0)                                 
         
         '''
         cond = torch.cat([
@@ -532,7 +612,9 @@ sample_test_dataset_1sec = Physio_1sec_raw_for_SOLID_from_lmdb(lmdb_dir=params.d
                                                      train=False,
                                                      split_by_sub=True,
                                                      mean=sample_train_dataset_1sec.mean,
-                                                     std=sample_train_dataset_1sec.std)
+                                                     std=sample_train_dataset_1sec.std,
+                                                     p1=sample_train_dataset_1sec.p1,
+                                                     p99=sample_train_dataset_1sec.p99)
 
 train_grid_dataset = EEGToGridCtx9_1sec(base_dataset=sample_train_dataset_1sec, 
                                         squash_tanh=params.squash_tanh, # TODO : tanh is bset option??
@@ -719,8 +801,8 @@ class GaussianDiffusion(nn.Module):
 
         noise = torch.randn_like(x0)
         x_t   = self.q_sample(x0, t, noise)
-        # x_cat = torch.cat([x_t, cond], dim=1)  # noised target + clean cond
-        x_cat = x_t # cond 없이 실험
+        x_cat = torch.cat([x_t, cond], dim=1)  # noised target + clean cond
+        # x_cat = x_t # cond 없이 실험
 
         pred = self.unet(x_cat, t)  # predict noise on target channel
 
@@ -748,8 +830,8 @@ class GaussianDiffusion(nn.Module):
     @torch.inference_mode()
     def p_sample(self, xt, cond, t, clip=True):
         bt = torch.full((xt.shape[0],), t, device=xt.device, dtype=torch.long)
-        # x_cat = torch.cat([xt, cond], dim=1)
-        x_cat = xt
+        x_cat = torch.cat([xt, cond], dim=1)
+        # x_cat = xt
         pred_noise = self.unet(x_cat, bt)
 
         def bcast(x): return x.view(-1,1,1,1)
@@ -792,7 +874,7 @@ class GaussianDiffusion(nn.Module):
 # ============================================================
 print("TRANING SETTING RUNNING")
 
-IN_CHANNELS = 200   # target(noised) + lat/lon + 9 past grids + 9 past masks = 21
+IN_CHANNELS = 200 + 200   # target(noised) + lat/lon + 9 past grids + 9 past masks = 21
 unet = UNet(base_dim=128, dim_mults=(1,2,4), in_channels=IN_CHANNELS, image_size=(H,W)).to(DEVICE)
 diffusion = GaussianDiffusion(unet, image_size=(H,W), time_steps=params.time_steps, loss_type='l2').to(DEVICE)
 
@@ -838,6 +920,25 @@ def inv_tanh_to_raw(x_tanh, mean, std, debug=False, tag="INV"):
             print(f"[{tag}] raw: min={raw.min().item():.3f} max={raw.max().item():.3f} "
                   f"mean={raw.mean().item():.3f} std={raw.std().item():.3f}")
     return z * std + mean
+
+def inv_tanh_percentile_to_raw(x_tanh, p1, p99, debug=False, tag="INV"):
+    if debug:
+        with torch.no_grad():
+            sat = (x_tanh.abs() > 0.98).float().mean().item()
+            mx  = x_tanh.abs().max().item()
+            print(f"[{tag}] x_tanh: min={x_tanh.min().item():.3f} max={x_tanh.max().item():.3f} "
+                  f"sat(|x|>0.98)={sat:.3f} max|x|={mx:.6f}")
+
+    # tanh inverse
+    x_clamped = x_tanh.clamp(-0.999, 0.999)
+    z = torch.atanh(x_clamped)              # z ≈ [-1,1] 근처였던 값으로 복원
+
+    # [-1,1] -> [0,1]
+    u = 0.5 * (z + 1.0)
+
+    # [0,1] -> raw
+    raw = u * (p99 - p1 + 1e-6) + p1
+    return raw
 
 @torch.no_grad()
 def eval_rmse(diffusion, loader): # add mini batch to check fast
@@ -906,8 +1007,16 @@ def eval_rmse_with_pbar(diffusion, loader, max_batches=None, show_pbar=True, pba
 
             if params.squash_tanh:
                 dbg = (bi == 0)
-                raw_hat = inv_tanh_to_raw(xhat,  mu_te, std_te, debug=dbg, tag="EVAL_hat")
-                raw_gt  = inv_tanh_to_raw(x0_te, mu_te, std_te, debug=dbg, tag="EVAL_gt")
+                # raw_hat = inv_tanh_to_raw(xhat,  mu_te, std_te, debug=dbg, tag="EVAL_hat")
+                # raw_gt  = inv_tanh_to_raw(x0_te, mu_te, std_te, debug=dbg, tag="EVAL_gt")
+                raw_hat = inv_tanh_percentile_to_raw(xhat, 
+                                                     p1=sample_train_dataset_1sec.p1,
+                                                     p99 = sample_train_dataset_1sec.p99,
+                                                     debug=dbg)
+                raw_gt = inv_tanh_percentile_to_raw(x0_te, 
+                                                     p1=sample_train_dataset_1sec.p1,
+                                                     p99 = sample_train_dataset_1sec.p99,
+                                                     debug=dbg)
                 # raw_hat = inv_tanh_to_raw(xhat,  mu_te, std_te)
                 # raw_gt  = inv_tanh_to_raw(x0_te, mu_te, std_te)
             else:
@@ -1168,8 +1277,16 @@ def overlay_panel(test_loader, model, save_path=os.path.join(params.result_dir, 
         xhat = model.sample(cb.to(DEVICE), clip=False).cpu()  # tanh(z)
 
         if params.squash_tanh:
-            raw_hat = inv_tanh_to_raw(xhat, mub[:,None,None,None], stdb[:,None,None,None]).squeeze(1)
-            raw_gt  = inv_tanh_to_raw(xb,   mub[:,None,None,None], stdb[:,None,None,None]).squeeze(1)
+            # raw_hat = inv_tanh_to_raw(xhat, mub[:,None,None,None], stdb[:,None,None,None]).squeeze(1)
+            # raw_gt  = inv_tanh_to_raw(xb,   mub[:,None,None,None], stdb[:,None,None,None]).squeeze(1)
+            raw_hat = inv_tanh_percentile_to_raw(xhat, 
+                                                     p1=sample_train_dataset_1sec.p1,
+                                                     p99 = sample_train_dataset_1sec.p99,
+                                                     debug=False)
+            raw_gt = inv_tanh_percentile_to_raw(xb, 
+                                                     p1=sample_train_dataset_1sec.p1,
+                                                     p99 = sample_train_dataset_1sec.p99,
+                                                     debug=False)
         else:
             raw_hat = xhat.squeeze(1)
             raw_hat = raw_hat*params.data_scaling_factor
@@ -1234,8 +1351,16 @@ def timecurve_panel(
 
         # --- raw로 복원 ---
         if params.squash_tanh:
-            raw_hat = inv_tanh_to_raw(xhat, mub[:,None,None,None], stdb[:,None,None,None]).squeeze(1)
-            raw_gt  = inv_tanh_to_raw(xb,   mub[:,None,None,None], stdb[:,None,None,None]).squeeze(1)
+            # raw_hat = inv_tanh_to_raw(xhat, mub[:,None,None,None], stdb[:,None,None,None]).squeeze(1)
+            # raw_gt  = inv_tanh_to_raw(xb,   mub[:,None,None,None], stdb[:,None,None,None]).squeeze(1)
+            raw_hat = inv_tanh_percentile_to_raw(xhat, 
+                                                     p1=sample_train_dataset_1sec.p1,
+                                                     p99 = sample_train_dataset_1sec.p99,
+                                                     debug=False)
+            raw_gt = inv_tanh_percentile_to_raw(xb, 
+                                                     p1=sample_train_dataset_1sec.p1,
+                                                     p99 = sample_train_dataset_1sec.p99,
+                                                     debug=False)    
         else:
             raw_hat = xhat.squeeze(1)
             raw_hat = raw_hat*params.data_scaling_factor

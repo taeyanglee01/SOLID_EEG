@@ -27,6 +27,9 @@ import torch, torch.nn as nn, torch.nn.functional as F
 from torchvision.utils import save_image, make_grid
 import matplotlib.pyplot as plt
 
+print("CLIP TRUE SETTING!")
+print("z / 3 working NOT TANH")
+
 #################### Argparse specific functions ####################
 
 def str2bool(v):
@@ -48,6 +51,7 @@ def get_parser_args(parser):
     parser.add_argument('--wd', type=float, default=1e-4, help='weight decay(default: 1e-4)')
     parser.add_argument('--dataset_dir', type=str, default='./', help='lmdb dataset dir')
     parser.add_argument('--result_dir', type=str, default='./', help='result saving dir')
+    parser.add_argument('--keep_ratio', type=float, default=0.9, help='keeping ratio for data')
     parser.add_argument('--squash_tanh', type=str2bool, default=True, help='tanh normalization')
     parser.add_argument('--data_scaling_factor', type=int, default=100, help='scaling factor for data')
     # step relevent arguments
@@ -218,8 +222,8 @@ class Physio_1sec_raw_for_SOLID_from_lmdb(Dataset):
             seed: int,
             train: bool,
             split_by_sub: bool,
-            seg_len_sec: int = 1,
-            stride_sec: int = 1,
+            seg_len_pts: int = 1,
+            stride_pts: int = 1,
             mean: float = 0.0,
             std: float = 1.0
     ):
@@ -236,8 +240,8 @@ class Physio_1sec_raw_for_SOLID_from_lmdb(Dataset):
         self.maxfold = maxfold
         self.targetfold = targetfold
 
-        self.seg_len_sec = seg_len_sec
-        self.stride_sec = stride_sec
+        self.seg_len_pts = seg_len_pts
+        self.stride_pts = stride_pts
 
         self.data, self.data_meta = self.make_segments_by_fold(
             self.targetfold, self.lmdb_keys, self.maxfold, self.split_by_sub, self.seed
@@ -260,11 +264,11 @@ class Physio_1sec_raw_for_SOLID_from_lmdb(Dataset):
         all_meta = []
 
         for key in use_keys:
-            seg_list, meta_list = self.segment_1sec_from_key(
-                key, self.db,
-                seg_len_sec=self.seg_len_sec,
-                stride_sec=self.stride_sec
-            )
+            seg_list, meta_list = self.segment_by_points_from_key(
+                    key, self.db,
+                    seg_len_pts=self.seg_len_pts,
+                    stride_pts=self.stride_pts
+                )
             all_segs += seg_list
             all_meta += meta_list
 
@@ -279,22 +283,18 @@ class Physio_1sec_raw_for_SOLID_from_lmdb(Dataset):
             raise KeyError(f"Key not found: {key}")
         return pickle.loads(v)
 
-    def segment_1sec_from_key(self, key, lmdb_db, seg_len_sec=1, stride_sec=1):
+    def segment_by_points_from_key(self, key, lmdb_db, seg_len_pts=1, stride_pts=1):
         """
-        sample_for_key['sample'] shape: (C, T, Fs)
-          - 여기서 T는 '초 단위 프레임 수'이고
-          - Fs는 1초 내 샘플 수(예: 200)
-
-        seg_len_sec=1이면:
-          x = eeg[:, t, :] -> (C, Fs)
-
-        seg_len_sec>1이면:
-          x = eeg[:, t:t+seg_len_sec, :] -> (C, seg_len_sec, Fs) -> flatten -> (C, seg_len_sec*Fs)
+        LMDB sample['sample'] shape: (C, T, Fs)
+        -> flatten to (C, T*Fs)
+        -> segment by points:
+        x = flat[:, p:p+seg_len_pts]  # (C, seg_len_pts)
+        default seg_len_pts=1 => (C, 1) per sample
         """
         sample_for_key = self.lmdb_get(lmdb_db, key)
 
         channel_name = sample_for_key['data_info']['channel_names']  # len=C
-        eeg = sample_for_key['sample']  # (C, T, Fs), numpy
+        eeg = sample_for_key['sample']  # (C, T, Fs), numpy or torch
 
         if isinstance(eeg, torch.Tensor):
             eeg_t = eeg.float()
@@ -303,18 +303,20 @@ class Physio_1sec_raw_for_SOLID_from_lmdb(Dataset):
 
         C, T, Fs = eeg_t.shape
 
-        if T < seg_len_sec:
+        # (C, T*Fs)
+        flat = eeg_t.reshape(C, T * Fs)
+
+        L = flat.shape[1]
+        if L < seg_len_pts:
             return [], []
 
         seg_list = []
         meta_list = []
 
-        for t in range(0, T - seg_len_sec + 1, stride_sec):
-            x = eeg_t[:, t:t+seg_len_sec, :]          # (C, seg_len_sec, Fs)
-            x = x.reshape(C, seg_len_sec * Fs)        # (C, seg_len_sec*Fs)  -> seg_len_sec=1이면 (C, Fs)
-
+        for p in range(0, L - seg_len_pts + 1, stride_pts):
+            x = flat[:, p:p + seg_len_pts]   # (C, seg_len_pts)
             seg_list.append(x)
-            meta_list.append(channel_name)
+            meta_list.append(channel_name)   # 필요하면 여기 더 풍부한 meta로 바꿔도 됨
 
         return seg_list, meta_list
 
@@ -463,7 +465,8 @@ class EEGToGridCtx9_1sec(Dataset):
         # (optional) squash to tanh space
         if self.squash:
             z = (full_grid - self.mean) / (self.std + 1e-6)
-            x0 = torch.tanh(z)
+            x0 = torch.clamp(z / 3, -1.0, 1.0) # divide 3 case
+            # x0 = torch.tanh(z) # tanh case
         else:
             x0 = full_grid/params.data_scaling_factor  # (L,H,W)
 
@@ -490,11 +493,11 @@ class EEGToGridCtx9_1sec(Dataset):
         # ---- cond ----
         
         cond = torch.cat([
-            self.lat_map.unsqueeze(0),            # (1,H,W)
-            self.lon_map.unsqueeze(0),            # (1,H,W)
+            # self.lat_map.unsqueeze(0),            # (1,H,W)
+             #self.lon_map.unsqueeze(0),            # (1,H,W)
             # t_index,                              # (L,H,W)
-            # obs_grid,                             # (L,H,W) # FIXME : 시간축 이거 필요 없을지도? 뺴고 한 번 넣고 한 번 해보자
-            obs_mask_hw.unsqueeze(0),             # (1,H,W)
+            obs_grid,                             # (L,H,W) # FIXME : 시간축 이거 필요 없을지도? 뺴고 한 번 넣고 한 번 해보자
+            # obs_mask_hw.unsqueeze(0),             # (1,H,W)
         ], dim=0)                                 # (L+3,H,W)
         
         '''
@@ -519,14 +522,14 @@ class EEGToGridCtx9_1sec(Dataset):
         return x0, loss_mask_hw.unsqueeze(0), cond, self.mean, self.std
 
 sample_train_dataset_1sec = Physio_1sec_raw_for_SOLID_from_lmdb(lmdb_dir=params.dataset_dir,
-                                                     maxfold=5,
+                                                     maxfold=10,
                                                      targetfold=0,
                                                      seed=params.seed,
                                                      train=True,
                                                      split_by_sub=True)
 
 sample_test_dataset_1sec = Physio_1sec_raw_for_SOLID_from_lmdb(lmdb_dir=params.dataset_dir,
-                                                     maxfold=5,
+                                                     maxfold=10,
                                                      targetfold=0,
                                                      seed=params.seed,
                                                      train=False,
@@ -537,14 +540,14 @@ sample_test_dataset_1sec = Physio_1sec_raw_for_SOLID_from_lmdb(lmdb_dir=params.d
 train_grid_dataset = EEGToGridCtx9_1sec(base_dataset=sample_train_dataset_1sec, 
                                         squash_tanh=params.squash_tanh, # TODO : tanh is bset option??
                                         channel_to_rc=CHANNEL_TO_RC,
-                                        keep_ratio=0.9, # TODO : sparsity option should be added
+                                        keep_ratio=params.keep_ratio, # TODO : sparsity option should be added
                                         seed=params.seed,
                                         loss_mode='all')
 
 test_grid_dataset = EEGToGridCtx9_1sec(base_dataset=sample_test_dataset_1sec, 
                                         squash_tanh=params.squash_tanh,
                                         channel_to_rc=CHANNEL_TO_RC,
-                                        keep_ratio=0.9,
+                                        keep_ratio=params.keep_ratio,
                                         seed=params.seed,
                                         loss_mode='all')
 
@@ -647,7 +650,7 @@ class UNet(nn.Module):
                 self.ups.append(nn.Upsample(scale_factor=2, mode='nearest')); self.kinds.append('up')
                 self.ups.append(nn.Conv2d(in_ch, in_ch, 3, padding=1));       self.kinds.append('conv')
 
-        self.final = nn.Sequential(nn.GroupNorm(groups, in_ch), nn.SiLU(), nn.Conv2d(in_ch, 200, 3, padding=1)) # output dim to 200 from 1
+        self.final = nn.Sequential(nn.GroupNorm(groups, in_ch), nn.SiLU(), nn.Conv2d(in_ch, 1, 3, padding=1)) # output dim to 200 from 1
 
     def forward(self, x_cat, t):
         # t_emb = self.time_mlp(self.time_pe(t))
@@ -719,8 +722,8 @@ class GaussianDiffusion(nn.Module):
 
         noise = torch.randn_like(x0)
         x_t   = self.q_sample(x0, t, noise)
-        # x_cat = torch.cat([x_t, cond], dim=1)  # noised target + clean cond
-        x_cat = x_t # cond 없이 실험
+        x_cat = torch.cat([x_t, cond], dim=1)  # noised target + clean cond
+        # x_cat = x_t # cond 없이 실험
 
         pred = self.unet(x_cat, t)  # predict noise on target channel
 
@@ -748,8 +751,8 @@ class GaussianDiffusion(nn.Module):
     @torch.inference_mode()
     def p_sample(self, xt, cond, t, clip=True):
         bt = torch.full((xt.shape[0],), t, device=xt.device, dtype=torch.long)
-        # x_cat = torch.cat([xt, cond], dim=1)
-        x_cat = xt
+        x_cat = torch.cat([xt, cond], dim=1)
+        # x_cat = xt
         pred_noise = self.unet(x_cat, bt)
 
         def bcast(x): return x.view(-1,1,1,1)
@@ -769,7 +772,7 @@ class GaussianDiffusion(nn.Module):
     @torch.inference_mode()
     def sample(self, cond, clip=False, debug=False):  # clip=False often gives crisper fields
         b = cond.size(0)
-        x = torch.randn((b,200,self.H,self.W), device=cond.device)
+        x = torch.randn((b,1,self.H,self.W), device=cond.device)
         watch = set([self.T-1, self.T//2, 0])
         for t in reversed(range(self.T)):
             x = self.p_sample(x, cond, t, clip=clip)
@@ -792,7 +795,7 @@ class GaussianDiffusion(nn.Module):
 # ============================================================
 print("TRANING SETTING RUNNING")
 
-IN_CHANNELS = 200   # target(noised) + lat/lon + 9 past grids + 9 past masks = 21
+IN_CHANNELS = 1 + 1   # target(noised) + lat/lon + 9 past grids + 9 past masks = 21
 unet = UNet(base_dim=128, dim_mults=(1,2,4), in_channels=IN_CHANNELS, image_size=(H,W)).to(DEVICE)
 diffusion = GaussianDiffusion(unet, image_size=(H,W), time_steps=params.time_steps, loss_type='l2').to(DEVICE)
 
@@ -815,7 +818,7 @@ sched = CosineAnnealingWarmupRestarts(
 # 7) Utilities: invert tanh->raw and metrics
 # ============================================================
 def inv_tanh_to_raw(x_tanh, mean, std, debug=False, tag="INV"):
-
+    '''
     if debug:
         with torch.no_grad():
             sat = (x_tanh.abs() > 0.98).float().mean().item()
@@ -838,6 +841,33 @@ def inv_tanh_to_raw(x_tanh, mean, std, debug=False, tag="INV"):
             print(f"[{tag}] raw: min={raw.min().item():.3f} max={raw.max().item():.3f} "
                   f"mean={raw.mean().item():.3f} std={raw.std().item():.3f}")
     return z * std + mean
+    '''
+    if debug:
+        with torch.no_grad():
+            sat = (x_tanh.abs() >= 0.999).float().mean().item()
+            mx  = x_tanh.abs().max().item()
+            print(f"[{tag}] x_clamp: min={x_tanh.min().item():.3f} "
+                  f"max={x_tanh.max().item():.3f} "
+                  f"sat(|x|>=0.999)={sat:.3f} max|x|={mx:.6f}")
+
+    # clamp inverse (linear region only)
+    z = 3.0 * x_tanh
+
+    if debug:
+        with torch.no_grad():
+            print(f"[{tag}] z(pseudo-inv): min={z.min().item():.3f} "
+                  f"max={z.max().item():.3f} "
+                  f"mean={z.mean().item():.3f} std={z.std().item():.3f}")
+
+    raw = z * std + mean
+
+    if debug:
+        with torch.no_grad():
+            print(f"[{tag}] raw: min={raw.min().item():.3f} "
+                  f"max={raw.max().item():.3f} "
+                  f"mean={raw.mean().item():.3f} std={raw.std().item():.3f}")
+
+    return raw
 
 @torch.no_grad()
 def eval_rmse(diffusion, loader): # add mini batch to check fast
@@ -850,7 +880,7 @@ def eval_rmse(diffusion, loader): # add mini batch to check fast
         mu_te  = mu_te.to(DEVICE)[:,None,None,None]
         std_te = std_te.to(DEVICE)[:,None,None,None]
 
-        xhat = diffusion.sample(c_te, clip=False)             # tanh(z)
+        xhat = diffusion.sample(c_te, clip=True)             # tanh(z)
         # raw µV
         if params.squash_tanh:
             raw_hat = inv_tanh_to_raw(xhat,  mu_te, std_te)
@@ -944,7 +974,7 @@ def eval_rmse_minibatch(diffusion, loader, max_batches=None): # add mini batch t
         mu_te  = mu_te.to(DEVICE)[:,None,None,None]
         std_te = std_te.to(DEVICE)[:,None,None,None]
 
-        xhat = diffusion.sample(c_te, clip=False)             # tanh(z)
+        xhat = diffusion.sample(c_te, clip=True)             # tanh(z)
         # raw µg/m³
         if params.squash_tanh:
             raw_hat = inv_tanh_to_raw(xhat,  mu_te, std_te)
@@ -1165,7 +1195,7 @@ def overlay_panel(test_loader, model, save_path=os.path.join(params.result_dir, 
 
     with torch.inference_mode():
         xb, mb, cb, mub, stdb = next(iter(test_loader))
-        xhat = model.sample(cb.to(DEVICE), clip=False).cpu()  # tanh(z)
+        xhat = model.sample(cb.to(DEVICE), clip=True).cpu()  # tanh(z)
 
         if params.squash_tanh:
             raw_hat = inv_tanh_to_raw(xhat, mub[:,None,None,None], stdb[:,None,None,None]).squeeze(1)
@@ -1176,9 +1206,9 @@ def overlay_panel(test_loader, model, save_path=os.path.join(params.result_dir, 
             raw_gt = xb.squeeze(1)
             raw_gt = raw_gt*params.data_scaling_factor
 
-        t0 = xhat.size(1)//2
-        raw_hat = raw_hat[:,t0]
-        raw_gt = raw_gt[:,t0]
+        # t0 = xhat.size(1)//2
+        # raw_hat = raw_hat[:,t0]
+        # raw_gt = raw_gt[:,t0]
         mb      = mb.squeeze(1)
 
     # vmax = float(mub.mean() + 3*stdb.mean())
@@ -1230,7 +1260,7 @@ def timecurve_panel(
 
     with torch.inference_mode():
         xb, mb, cb, mub, stdb = next(iter(test_loader))
-        xhat = model.sample(cb.to(DEVICE), clip=False).cpu()  # tanh(z)
+        xhat = model.sample(cb.to(DEVICE), clip=True).cpu()  # tanh(z)
 
         # --- raw로 복원 ---
         if params.squash_tanh:
@@ -1333,7 +1363,7 @@ def timecurve_panel(
 
 # ---- Run an overlay on current (or best-loaded) model ----
 overlay_panel(test_loader, diffusion)
-timecurve_panel(test_loader, diffusion, points=[(4,6), (6,4), (8,6), (6,8)])
+# timecurve_panel(test_loader, diffusion, points=[(4,6), (6,4), (8,6), (6,8)])
 
 # ============================================================
 # 10) Load best checkpoint & run full test-day eval again
@@ -1347,12 +1377,12 @@ def load_and_eval(ckpt_path, test_loader):
     diff.eval()
 
     # rmse_raw, rmse_norm, nobs = eval_rmse(diff, test_loader) # FIXME : original eval code
-    rmse_raw, rmse_norm, nobs = eval_rmse_with_pbar(diffusion, test_loader, max_batches=None, show_pbar=True)
+    rmse_raw, rmse_norm, nobs = eval_rmse_with_pbar(diffusion, test_loader, max_batches=1000, show_pbar=True)
     # rmse_raw, rmse_norm, nobs = eval_rmse_minibatch(diff, test_loader, max_batches=2)
     # print(f"[BEST] Test RMSE_raw={rmse_raw:.3f} µg/m³ | RMSE_norm={rmse_norm:.3f} (over {nobs} bins)")
     print(f"[BEST] Test RMSE_raw={rmse_raw:.3f} µV (over {nobs} bins)")
     overlay_panel(test_loader, diff, save_path=os.path.join(params.result_dir, 'ctx9_overlay_best.png'))
-    timecurve_panel(test_loader, diffusion, points=[(4,6), (6,4), (8,6), (6,8)])
+    # timecurve_panel(test_loader, diffusion, points=[(4,6), (6,4), (8,6), (6,8)])
     return diff
 
 # Example (after training): 

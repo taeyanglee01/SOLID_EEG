@@ -1,15 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=gen_multisubject_eeg
-#SBATCH --output=logs/multisubject_eeg_%j.out
-#SBATCH --error=logs/multisubject_eeg_%j.err
-#SBATCH --time=48:00:00
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64GB
-#SBATCH --account=m4239
-#SBATCH --constraint=cpu
-#SBATCH --qos=regular
+#SBATCH -A m4727_g
+#SBATCH -C gpu #&hbm80g
+#SBATCH -q shared #preempt #regular #shared #regular, shared,  #! 30 mins is enough so debug
+#SBATCH --job-name=SOPh1227
+#SBATCH --output=/pscratch/sd/t/tylee/slurm_outputs/solid/251227_SOLID_Physio_sample_test-%A_%a.out
+#SBATCH --error=/pscratch/sd/t/tylee/slurm_outputs/solid/251227_SOLID_Physio_sample_test-%A_%a.err
+#SBATCH -N 1
+#SBATCH --ntasks-per-node=1
+#SBATCH -t 5:00:00
 
 # ==============================================================================
 # Multi-Subject EEG Data Generation Script
@@ -19,10 +17,10 @@
 # ==============================================================================
 
 # Configuration
-N_SUBJECTS=100
-OUTPUT_DIR="/pscratch/sd/t/tylee/SOLID_EEG_RESULT/synthetic_eeg/multisubject_data_$(date +%y%m%d)"
+N_SUBJECTS=50
+OUTPUT_DIR="/pscratch/sd/t/tylee/SOLID_EEG_RESULT/synthetic_eeg/multisubject_data"
 N_CHANNELS=64
-SFREQ=250
+SFREQ=200
 
 # Task durations (in seconds)
 MOTOR_DURATION=120
@@ -37,18 +35,7 @@ TASKS="all"
 # Setup
 # ==============================================================================
 
-# Create logs directory if it doesn't exist
-mkdir -p logs
-
 # Print job information
-echo "===================================================================="
-echo "Multi-Subject EEG Data Generation"
-echo "===================================================================="
-echo "Job ID: $SLURM_JOB_ID"
-echo "Node: $SLURM_NODELIST"
-echo "Start time: $(date)"
-echo "===================================================================="
-echo ""
 
 # Print configuration
 echo "Configuration:"
@@ -73,16 +60,11 @@ echo ""
 
 # Activate conda environment
 # Replace 'your_eeg_env' with your actual environment name
-source activate base
-# conda activate your_eeg_env
+module load conda
+conda activate fingerflex
 
-# Set Python path to include current directory
-export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+cd /pscratch/sd/t/tylee/SOLID_EEG/synthetic
 
-# Verify Python environment
-echo "Python environment:"
-python --version
-echo ""
 
 # ==============================================================================
 # Run Data Generation
@@ -103,37 +85,6 @@ python generate_task_specific_eeg_multisubject.py \
     --p300_duration $P300_DURATION \
     --emotion_duration $EMOTION_DURATION
 
-# Check if the script completed successfully
-if [ $? -eq 0 ]; then
-    echo ""
-    echo "===================================================================="
-    echo "Data generation completed successfully!"
-    echo "===================================================================="
-    echo "Output directory: $OUTPUT_DIR"
-    echo "End time: $(date)"
-    echo "===================================================================="
-
-    # Print summary statistics
-    echo ""
-    echo "Summary:"
-    echo "  Number of subject directories created:"
-    ls -d $OUTPUT_DIR/sub-* 2>/dev/null | wc -l
-    echo "  Total disk space used:"
-    du -sh $OUTPUT_DIR
-    echo "  Number of files per subject (first subject):"
-    ls $OUTPUT_DIR/sub-001/ 2>/dev/null | wc -l
-    echo ""
-
-else
-    echo ""
-    echo "===================================================================="
-    echo "ERROR: Data generation failed!"
-    echo "===================================================================="
-    echo "End time: $(date)"
-    echo "Please check the error log for details."
-    echo "===================================================================="
-    exit 1
-fi
 
 # ==============================================================================
 # Optional: Create metadata file

@@ -46,10 +46,8 @@ def get_parser_args(parser):
     parser.add_argument('--max_lr', type=float, default=4e-4, help='max learning rate(default: 4e-4)')
     parser.add_argument('--min_lr', type=float, default=8e-6, help='min learning rate(default: 8e-6)')
     parser.add_argument('--wd', type=float, default=1e-4, help='weight decay(default: 1e-4)')
-    parser.add_argument('--dataset_dir', type=str, default='./', help='lmdb dataset dir')
     parser.add_argument('--result_dir', type=str, default='./', help='result saving dir')
     parser.add_argument('--squash_tanh', type=str2bool, default=True, help='tanh normalization')
-    parser.add_argument('--data_scaling_factor', type=int, default=100, help='scaling factor for data')
     # step relevent arguments
     parser.add_argument('--time_steps', type=int, default=1000, help='diffusion time steps')
     parser.add_argument('--total_steps', type=int, default=100000, help='learning total steps')
@@ -118,7 +116,7 @@ def random_seed(seed):
 KeyT = Union[str, bytes, bytearray]
 
 _KEY_RE = re.compile(
-   r"^S(?P<sub_id>\d{3})R\d{2}-\d+$"
+    r"^sub-(?P<sub_id>\d{3})/(?P<task>[A-Za-z0-9_]+)-(?P<seg_idx>\d+)$"
 )
 
 def _decode_key(k: KeyT) -> str:
@@ -220,8 +218,6 @@ class Physio_1sec_raw_for_SOLID_from_lmdb(Dataset):
             split_by_sub: bool,
             seg_len_sec: int = 1,
             stride_sec: int = 1,
-            mean: float = 0.0,
-            std: float = 1.0
     ):
         random_seed(seed)
         self.seed = seed
@@ -242,12 +238,6 @@ class Physio_1sec_raw_for_SOLID_from_lmdb(Dataset):
         self.data, self.data_meta = self.make_segments_by_fold(
             self.targetfold, self.lmdb_keys, self.maxfold, self.split_by_sub, self.seed
         )
-
-        if self.train:
-            self._compute_mean_std()
-        else:
-            self.mean = float(mean)
-            self.std  = float(std)
 
     def make_segments_by_fold(self, fold, lmdb_keys, maxfold, split_by_sub, seed):
         train_keys, test_keys = train_test_split_by_fold_num(
@@ -317,34 +307,6 @@ class Physio_1sec_raw_for_SOLID_from_lmdb(Dataset):
             meta_list.append(channel_name)
 
         return seg_list, meta_list
-
-    def _compute_mean_std(self):
-        """
-        Compute mean/std over the entire TRAIN dataset.
-        Uses streaming to avoid memory blow-up.
-        """
-        print("[PhysioDataset] Computing mean/std from TRAIN set...")
-
-        total_sum = 0.0
-        total_sq  = 0.0
-        total_n   = 0
-
-        for x in self.data:
-            # x: (C, L)
-            x = x.float()
-
-            total_sum += x.sum().item()
-            total_sq  += (x ** 2).sum().item()
-            total_n   += x.numel()
-
-        mean = total_sum / total_n
-        var  = total_sq / total_n - mean ** 2
-        std  = (var ** 0.5) if var > 0 else 1.0
-
-        self.mean = float(mean)
-        self.std  = float(std)
-
-        print(f"[Train Dataset] mean={self.mean:.6f}, std={self.std:.6f}")
 
     def __len__(self):
         return len(self.data)
@@ -461,20 +423,7 @@ class EEGToGridCtx9_1sec(Dataset):
         )
 
         # (optional) squash to tanh space
-        if self.squash:
-            z = (full_grid - self.mean) / (self.std + 1e-6)
-            x0 = torch.tanh(z)
-        else:
-            x0 = full_grid/params.data_scaling_factor  # (L,H,W)
-
-        # DEBUG PRINT
-        if self.squash and idx == 0:
-            with torch.no_grad():
-                z = (full_grid - self.mean) / (self.std + 1e-6)
-                sat = (x0.abs() > 0.98).float().mean().item()
-                print(f"[DS] mean={self.mean:.4f} std={self.std:.4f} | "
-                    f"z: min={z.min():.2f} max={z.max():.2f} p(|z|>3)={(z.abs()>3).float().mean():.3f} | "
-                    f"x0: min={x0.min():.2f} max={x0.max():.2f} sat(|x0|>0.98)={sat:.3f}")
+        x0 = torch.tanh(full_grid) if self.squash else full_grid*1e-2  # (L,H,W)
 
         # ---- observed subset mask (spatial only) ----
         obs_mask_hw = self._sample_obs_mask(tgt_mask_hw, idx)     # (H,W)
@@ -482,28 +431,21 @@ class EEGToGridCtx9_1sec(Dataset):
         # ---- observed input grid ----
         obs_grid = x0 * obs_mask_hw.unsqueeze(0)                  # (L,H,W)
 
-        L = full_grid.shape[0]
-        t_index = torch.linspace(
-            0.0, 1.0, steps=L, device=full_grid.device
-        ).view(L, 1, 1).expand(L, H, W)
-
         # ---- cond ----
-        
+        '''
         cond = torch.cat([
             self.lat_map.unsqueeze(0),            # (1,H,W)
             self.lon_map.unsqueeze(0),            # (1,H,W)
-            # t_index,                              # (L,H,W)
-            # obs_grid,                             # (L,H,W) # FIXME : 시간축 이거 필요 없을지도? 뺴고 한 번 넣고 한 번 해보자
+            obs_grid,                             # (L,H,W) # FIXME : 시간축 이거 필요 없을지도? 뺴고 한 번 넣고 한 번 해보자
             obs_mask_hw.unsqueeze(0),             # (1,H,W)
         ], dim=0)                                 # (L+3,H,W)
-        
         '''
+
         cond = torch.cat([
             self.lat_map.unsqueeze(0),            # (1,H,W)
             self.lon_map.unsqueeze(0),            # (1,H,W)
             obs_mask_hw.unsqueeze(0),             # (1,H,W)
         ], dim=0)  
-        '''
 
         # ---- loss mask: where to supervise ----
         # electrode bins only (tgt_mask_hw) + (unobserved OR observed)
@@ -518,21 +460,19 @@ class EEGToGridCtx9_1sec(Dataset):
 
         return x0, loss_mask_hw.unsqueeze(0), cond, self.mean, self.std
 
-sample_train_dataset_1sec = Physio_1sec_raw_for_SOLID_from_lmdb(lmdb_dir=params.dataset_dir,
+sample_train_dataset_1sec = Physio_1sec_raw_for_SOLID_from_lmdb(lmdb_dir='/pscratch/sd/t/tylee/Dataset/SYNTHETIC_Seizure_EEG_200Hz_lowpass40_for_SOLID',
                                                      maxfold=5,
                                                      targetfold=0,
                                                      seed=params.seed,
                                                      train=True,
                                                      split_by_sub=True)
 
-sample_test_dataset_1sec = Physio_1sec_raw_for_SOLID_from_lmdb(lmdb_dir=params.dataset_dir,
+sample_test_dataset_1sec = Physio_1sec_raw_for_SOLID_from_lmdb(lmdb_dir='/pscratch/sd/t/tylee/Dataset/SYNTHETIC_Seizure_EEG_200Hz_lowpass40_for_SOLID',
                                                      maxfold=5,
                                                      targetfold=0,
                                                      seed=params.seed,
                                                      train=False,
-                                                     split_by_sub=True,
-                                                     mean=sample_train_dataset_1sec.mean,
-                                                     std=sample_train_dataset_1sec.std)
+                                                     split_by_sub=True)
 
 train_grid_dataset = EEGToGridCtx9_1sec(base_dataset=sample_train_dataset_1sec, 
                                         squash_tanh=params.squash_tanh, # TODO : tanh is bset option??
@@ -710,30 +650,18 @@ class GaussianDiffusion(nn.Module):
 
     def forward(self, x0, mask, cond):
         """
-        x0:   (B,T,H,W) in tanh(z) space
-        mask: (B,1,H,W)  (1=observed bin in target; 0=unobserved) # T -> 1
-        cond: (B,3,H,W) = [lat, lon, obs_mask] # cond 자체를 제거해서 돌려보기 당장 interpolation하는 것은 아니니 지금은 제거해도 괜찮을 것
+        x0:   (B,1,H,W) in tanh(z) space
+        mask: (B,1,H,W)  (1=observed bin in target; 0=unobserved)
+        cond: (B,20,H,W) = [lat, lon, past_grids(9), past_masks(9)]
         """
         b = x0.size(0)
         t = torch.randint(0, self.T, (b,), device=x0.device).long()
 
         noise = torch.randn_like(x0)
         x_t   = self.q_sample(x0, t, noise)
-        # x_cat = torch.cat([x_t, cond], dim=1)  # noised target + clean cond
-        x_cat = x_t # cond 없이 실험
+        x_cat = torch.cat([x_t, cond], dim=1)  # noised target + clean cond
 
         pred = self.unet(x_cat, t)  # predict noise on target channel
-
-        # DEBUG PRINT
-        if torch.rand(()) < 0.001:
-            with torch.no_grad():
-                # x0는 tanh(z) 공간, noise는 N(0,1), pred도 ideally N(0,1) 근처
-                print(f"[Diff] x0: ({x0.min().item():.2f},{x0.max().item():.2f}) "
-                    f"sat={(x0.abs()>0.98).float().mean().item():.3f} | "
-                    f"x_t: mean={x_t.mean().item():.3f} std={x_t.std().item():.3f} | "
-                    f"noise: mean={noise.mean().item():.3f} std={noise.std().item():.3f} | "
-                    f"pred:  mean={pred.mean().item():.3f} std={pred.std().item():.3f} "
-                    f"pred_abs>5={(pred.abs()>5).float().mean().item():.3f}")
 
         if self.loss_type == 'l1':
             raw = F.l1_loss(noise, pred, reduction='none')
@@ -748,8 +676,7 @@ class GaussianDiffusion(nn.Module):
     @torch.inference_mode()
     def p_sample(self, xt, cond, t, clip=True):
         bt = torch.full((xt.shape[0],), t, device=xt.device, dtype=torch.long)
-        # x_cat = torch.cat([xt, cond], dim=1)
-        x_cat = xt
+        x_cat = torch.cat([xt, cond], dim=1)
         pred_noise = self.unet(x_cat, bt)
 
         def bcast(x): return x.view(-1,1,1,1)
@@ -757,8 +684,7 @@ class GaussianDiffusion(nn.Module):
             x0 = bcast(self.sqrt_recip_alpha_bar[bt]) * xt - bcast(self.sqrt_recip_alpha_bar_min_1[bt]) * pred_noise
             x0 = x0.clamp(-1., 1.)
             c1 = self.beta[bt] * torch.sqrt(self.alpha_bar_prev[bt]) / (1. - self.alpha_bar[bt])
-            c2 = torch.sqrt(self.alpha[bt]) * (1. - self.alpha_bar_prev[bt]) / (1. - self.alpha_bar[bt])
-            # c2 = torch.sqrt(self.alpha[bt]) * (1. - self.alpha_bar_prev[bt]) / (1. - self.alpha[bt]) # FIXME : original code
+            c2 = torch.sqrt(self.alpha[bt]) * (1. - self.alpha_bar_prev[bt]) / (1. - self.alpha[bt])
             mean = bcast(c1) * x0 + bcast(c2) * xt
         else:
             mean = bcast(self.sqrt_recip_alpha[bt]) * (xt - bcast(self.beta_over_sqrt_one_minus_alpha_bar[bt]) * pred_noise)
@@ -767,22 +693,9 @@ class GaussianDiffusion(nn.Module):
         return mean + torch.sqrt(bcast(var)) * noise
 
     @torch.inference_mode()
-    def sample(self, cond, clip=False, debug=False):  # clip=False often gives crisper fields
+    def sample(self, cond, clip=False):  # clip=False often gives crisper fields
         b = cond.size(0)
         x = torch.randn((b,200,self.H,self.W), device=cond.device)
-        watch = set([self.T-1, self.T//2, 0])
-        for t in reversed(range(self.T)):
-            x = self.p_sample(x, cond, t, clip=clip)
-            if debug and (t in watch):
-                sat = (x.abs() > 0.98).float().mean().item()
-                print(f"[SAMPLE] t={t:4d} x: min={x.min().item():.3f} max={x.max().item():.3f} "
-                    f"sat(|x|>0.98)={sat:.3f}")
-
-        x = x.clamp(-1, 1)
-        if debug:
-            sat = (x.abs() > 0.98).float().mean().item()
-            print(f"[SAMPLE] final clamp x: sat(|x|>0.98)={sat:.3f}")
-        return x
         for t in reversed(range(self.T)):
             x = self.p_sample(x, cond, t, clip=clip)
         return x.clamp(-1, 1)
@@ -792,7 +705,7 @@ class GaussianDiffusion(nn.Module):
 # ============================================================
 print("TRANING SETTING RUNNING")
 
-IN_CHANNELS = 200   # target(noised) + lat/lon + 9 past grids + 9 past masks = 21
+IN_CHANNELS = 200 + 2 + 1   # target(noised) + lat/lon + 9 past grids + 9 past masks = 21
 unet = UNet(base_dim=128, dim_mults=(1,2,4), in_channels=IN_CHANNELS, image_size=(H,W)).to(DEVICE)
 diffusion = GaussianDiffusion(unet, image_size=(H,W), time_steps=params.time_steps, loss_type='l2').to(DEVICE)
 
@@ -814,29 +727,8 @@ sched = CosineAnnealingWarmupRestarts(
 # ============================================================
 # 7) Utilities: invert tanh->raw and metrics
 # ============================================================
-def inv_tanh_to_raw(x_tanh, mean, std, debug=False, tag="INV"):
-
-    if debug:
-        with torch.no_grad():
-            sat = (x_tanh.abs() > 0.98).float().mean().item()
-            mx  = x_tanh.abs().max().item()
-            print(f"[{tag}] x_tanh: min={x_tanh.min().item():.3f} max={x_tanh.max().item():.3f} "
-                  f"sat(|x|>0.98)={sat:.3f} max|x|={mx:.6f}")
-# TODO : z norm 이후에 min max까지 맞추는 것은 굳이이므로 뺴서 실험해보기 -> input의 통계량을 시각화해서 보여드리기
-    x_clamped = x_tanh.clamp(-0.999, 0.999)
-    z = torch.atanh(x_clamped)
-
-    # DEBUG PRINT
-    if debug:
-        with torch.no_grad():
-            # atanh 결과가 크면 raw가 터질 수 있음
-            print(f"[{tag}] z(atanh): min={z.min().item():.3f} max={z.max().item():.3f} "
-                  f"mean={z.mean().item():.3f} std={z.std().item():.3f}")
-    raw = z * std + mean
-    if debug:
-        with torch.no_grad():
-            print(f"[{tag}] raw: min={raw.min().item():.3f} max={raw.max().item():.3f} "
-                  f"mean={raw.mean().item():.3f} std={raw.std().item():.3f}")
+def inv_tanh_to_raw(x_tanh, mean, std):
+    z = torch.atanh(x_tanh.clamp(-0.999, 0.999))
     return z * std + mean
 
 @torch.no_grad()
@@ -851,13 +743,13 @@ def eval_rmse(diffusion, loader): # add mini batch to check fast
         std_te = std_te.to(DEVICE)[:,None,None,None]
 
         xhat = diffusion.sample(c_te, clip=False)             # tanh(z)
-        # raw µV
+        # raw µg/m³
         if params.squash_tanh:
             raw_hat = inv_tanh_to_raw(xhat,  mu_te, std_te)
             raw_gt  = inv_tanh_to_raw(x0_te, mu_te, std_te)
         else:
-            raw_hat = xhat*params.data_scaling_factor
-            raw_gt = x0_te*params.data_scaling_factor
+            raw_hat = xhat*100
+            raw_gt = x0_te*100
 
         mse_sum_raw  += ((raw_hat - raw_gt)**2 * m_te).sum().item()
         w_sum        += m_te.sum().item()
@@ -892,27 +784,14 @@ def eval_rmse_with_pbar(diffusion, loader, max_batches=None, show_pbar=True, pba
             mu_te  = mu_te.to(DEVICE)[:, None, None, None]
             std_te = std_te.to(DEVICE)[:, None, None, None]
 
-            xhat = diffusion.sample(c_te, clip=True, debug=(bi==0))
-
-            if bi == 0:
-                with torch.no_grad():
-                    sat = (xhat.abs() > 0.98).float().mean().item()
-                    print(f"[EVAL] xhat(tanh): min={xhat.min().item():.3f} max={xhat.max().item():.3f} "
-                        f"sat(|x|>0.98)={sat:.3f} | clip=True")
-
-                    # mask 적용이 제대로 전극 위치에만 되는지 확인
-                    print(f"[EVAL] mask: mean={m_te.mean().item():.3f} sum={m_te.sum().item():.0f} "
-                        f"shape={tuple(m_te.shape)}")
+            xhat = diffusion.sample(c_te, clip=False)
 
             if params.squash_tanh:
-                dbg = (bi == 0)
-                raw_hat = inv_tanh_to_raw(xhat,  mu_te, std_te, debug=dbg, tag="EVAL_hat")
-                raw_gt  = inv_tanh_to_raw(x0_te, mu_te, std_te, debug=dbg, tag="EVAL_gt")
-                # raw_hat = inv_tanh_to_raw(xhat,  mu_te, std_te)
-                # raw_gt  = inv_tanh_to_raw(x0_te, mu_te, std_te)
+                raw_hat = inv_tanh_to_raw(xhat,  mu_te, std_te)
+                raw_gt  = inv_tanh_to_raw(x0_te, mu_te, std_te)
             else:
-                raw_hat = xhat*params.data_scaling_factor
-                raw_gt = x0_te*params.data_scaling_factor
+                raw_hat = xhat*100
+                raw_gt = x0_te*100
 
             mse_sum_raw  += ((raw_hat - raw_gt)**2 * m_te).sum().item()
             w_sum        += m_te.sum().item()
@@ -950,8 +829,8 @@ def eval_rmse_minibatch(diffusion, loader, max_batches=None): # add mini batch t
             raw_hat = inv_tanh_to_raw(xhat,  mu_te, std_te)
             raw_gt  = inv_tanh_to_raw(x0_te, mu_te, std_te)
         else:
-            raw_hat = xhat*params.data_scaling_factor
-            raw_gt = x0_te*params.data_scaling_factor
+            raw_hat = xhat*100
+            raw_gt = x0_te*100
 
         mse_sum_raw  += ((raw_hat - raw_gt)**2 * m_te).sum().item()
         w_sum        += m_te.sum().item()
@@ -1082,21 +961,6 @@ for step in pbar:
     msk  = msk.to(DEVICE, non_blocking=True)
     cond = cond.to(DEVICE, non_blocking=True)
 
-    # DEBUG PRINT
-    if step == 0:
-        print("[Train] shapes:",
-            "x0", tuple(x0.shape),
-            "msk", tuple(msk.shape),
-            "cond", tuple(cond.shape))
-
-    # 주기적으로 x0 포화율 확인
-    if (step+1) % params.log_every == 0:
-        with torch.no_grad():
-            sat = (x0.abs() > 0.98).float().mean().item()
-            print(f"[Train] step={step+1} x0 range=({x0.min().item():.2f},{x0.max().item():.2f}) "
-                f"sat(|x0|>0.98)={sat:.3f} | cond range=({cond.min().item():.2f},{cond.max().item():.2f}) "
-                f"mask mean={msk.mean().item():.3f}")
-
     opt.zero_grad(set_to_none=True)
     loss = diffusion(x0, msk, cond)
     loss.backward()
@@ -1160,8 +1024,6 @@ def overlay_panel(test_loader, model, save_path=os.path.join(params.result_dir, 
     import matplotlib.colors as colors
     from matplotlib.colors import LinearSegmentedColormap
     cmap0 = LinearSegmentedColormap.from_list('', ['white', 'orange', 'red'])
-    cmap0 = cmap0.copy()
-    cmap0.set_bad(color='lightgray')
 
     with torch.inference_mode():
         xb, mb, cb, mub, stdb = next(iter(test_loader))
@@ -1172,9 +1034,9 @@ def overlay_panel(test_loader, model, save_path=os.path.join(params.result_dir, 
             raw_gt  = inv_tanh_to_raw(xb,   mub[:,None,None,None], stdb[:,None,None,None]).squeeze(1)
         else:
             raw_hat = xhat.squeeze(1)
-            raw_hat = raw_hat*params.data_scaling_factor
+            raw_hat = raw_hat*100
             raw_gt = xb.squeeze(1)
-            raw_gt = raw_gt*params.data_scaling_factor
+            raw_gt = raw_gt*100
 
         t0 = xhat.size(1)//2
         raw_hat = raw_hat[:,t0]
@@ -1191,10 +1053,8 @@ def overlay_panel(test_loader, model, save_path=os.path.join(params.result_dir, 
         for row, arr in enumerate([raw_gt[i].numpy(), raw_hat[i].numpy()]):
             ax = axes[row, i]
             if back is not None: ax.imshow(back, extent=[0,1,0,1], alpha=0.6)
-            mask = (mb[i].numpy() == 0)
-            arr_plot = np.ma.array(arr, mask=mask)
-            # arr_plot = arr.copy()
-            # arr_plot[mb[i].numpy() == 0] = np.nan  # show only observed bins
+            arr_plot = arr.copy()
+            arr_plot[mb[i].numpy() == 0] = np.nan  # show only observed bins
             pm = ax.pcolormesh(lon_edges, lat_edges, arr_plot, cmap=cmap0,
                                norm=colors.Normalize(vmin=0, vmax=vmax))
             # draw grid
@@ -1238,9 +1098,9 @@ def timecurve_panel(
             raw_gt  = inv_tanh_to_raw(xb,   mub[:,None,None,None], stdb[:,None,None,None]).squeeze(1)
         else:
             raw_hat = xhat.squeeze(1)
-            raw_hat = raw_hat*params.data_scaling_factor
+            raw_hat = raw_hat*100
             raw_gt = xb.squeeze(1)
-            raw_gt = raw_gt*params.data_scaling_factor
+            raw_gt = raw_gt*100
 
         # raw_hat/raw_gt: (B,T,H,W) 라고 가정
         # mb: (B,1,H,W) 또는 (B,T,H,W)일 수 있음 → (B,*,H,W)로 맞춰 사용
