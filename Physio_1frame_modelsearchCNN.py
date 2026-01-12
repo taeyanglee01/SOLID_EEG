@@ -27,6 +27,8 @@ import torch, torch.nn as nn, torch.nn.functional as F
 from torchvision.utils import save_image, make_grid
 import matplotlib.pyplot as plt
 
+from model_utils import PreUNetMLPMixer, PixelTimeLSTM, PreUNetTemporalAttnMixer
+
 #################### Argparse specific functions ####################
 
 def str2bool(v):
@@ -52,6 +54,7 @@ def get_parser_args(parser):
     parser.add_argument('--squash_tanh', type=str2bool, default=True, help='tanh normalization')
     parser.add_argument('--data_scaling_factor', type=int, default=100, help='scaling factor for data')
     parser.add_argument('--data_segment', type=int, default=1, help='number of data segment time points')
+    parser.add_argument('--use_lstm', type=str2bool, default=False, help='add lstm in resnet')
     # step relevent arguments
     parser.add_argument('--time_steps', type=int, default=1000, help='diffusion time steps')
     parser.add_argument('--total_steps', type=int, default=100000, help='learning total steps')
@@ -584,6 +587,45 @@ class ResnetBlock(nn.Module):
         h = self.conv2(self.dropout(self.act(self.norm2(h))))
         return h + self.res(x)
 
+class ResnetBlock_withLSTM(nn.Module):
+    def __init__(self, dim, dim_out=None, time_emb_dim=None, dropout=0.0, groups=32, 
+                    use_lstm=False, T=None, lstm_hidden=64, lstm_groups=8):
+        super().__init__()
+        dim_out = dim if dim_out is None else dim_out
+        self.mlp = nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, dim_out)) if time_emb_dim else None
+        self.norm1 = nn.GroupNorm(groups, dim);     self.conv1 = nn.Conv2d(dim, dim_out, 3, padding=1)
+        self.norm2 = nn.GroupNorm(groups, dim_out); self.conv2 = nn.Conv2d(dim_out, dim_out, 3, padding=1)
+        self.dropout = nn.Dropout(dropout) if dropout else nn.Identity()
+        self.act = nn.SiLU()
+        self.res = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
+
+        self.use_lstm = use_lstm
+        if use_lstm:
+            assert T is not None, "Need T=params.data_segment for LSTM temporal mixing"
+            # dim_out이 T 배수가 아닐 가능성이 높아서 in/out proj로 맞추는 버전 사용
+            self.temporal = PixelTimeLSTM(
+                T=T,
+                hidden=lstm_hidden,
+                num_layers=1,
+                dropout=dropout,
+                use_in_proj=True,
+                in_channels=dim_out,
+                group_channels=lstm_groups
+            )
+            # gating (optional): 너무 세게 들어오면 학습 불안정 -> 게이트로 조절
+            self.gate = nn.Parameter(torch.tensor(0.0))  # 시작은 거의 0 (안 켠 것처럼)
+        else:
+            self.temporal = None
+            self.gate = None
+    def forward(self, x, t_emb=None):
+        h = self.conv1(self.act(self.norm1(x)))
+        if self.mlp is not None and t_emb is not None:
+            h = h + self.mlp(t_emb)[..., None, None]
+        if self.temporal is not None: # use lstm ver
+            h = h + torch.tanh(self.gate) * self.temporal(h)
+        h = self.conv2(self.dropout(self.act(self.norm2(h))))
+        return h + self.res(x)
+
 
 class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, base_dim):
@@ -611,12 +653,154 @@ class TimeMLP(nn.Module):
     def forward(self, t):  # (B,)
         return self.net(t[:,None].float())
 
+class TemporalIndexEncoding(nn.Module):
+    """
+    time index τ=0..T-1에 대한 임베딩을 만들고,
+    role(noisy/cond)별로 다른 projection을 통해
+    (B, T, H, W)에 bias로 더해주는 모듈.
+    """
+    def __init__(self, eeg_t, emb_dim=128, out_per_tau=1):
+        super().__init__()
+        self.eeg_t = eeg_t
+        self.emb = nn.Embedding(eeg_t, emb_dim)
+
+        # role-aware projection: noisy용 / cond용
+        self.proj_x = nn.Sequential(nn.SiLU(), nn.Linear(emb_dim, out_per_tau))
+        self.proj_c = nn.Sequential(nn.SiLU(), nn.Linear(emb_dim, out_per_tau))
+
+        # out_per_tau=1이면 각 time-slice에 scalar bias
+        self.out_per_tau = out_per_tau
+
+    def forward(self, x_cat):
+        """
+        x_cat: (B, 2T, H, W)
+        return: (B, 2T, H, W)  # TE 주입된 입력
+        """
+        _, C, _, _ = x_cat.shape
+        assert C == 2*self.eeg_t, f"Expected channels=2T={2*self.eeg_t}, got {C}"
+
+        x = x_cat[:, :self.eeg_t]      # (B, T, H, W)
+        c = x_cat[:, self.eeg_t:2*self.eeg_t]   # (B, T, H, W)
+
+        # τ index: (T,)
+        tau = torch.arange(self.eeg_t, device=x_cat.device)
+
+        # E(τ): (T, emb_dim)
+        e = self.emb(tau)
+
+        # role-aware bias: (T, out_per_tau)
+        bx = self.proj_x(e)   # (T, out_per_tau)
+        bc = self.proj_c(e)   # (T, out_per_tau)
+
+        if self.out_per_tau == 1:
+            # (T,) -> (1, T, 1, 1) 로 broadcast
+            bx = bx.squeeze(-1)[None, :, None, None]
+            bc = bc.squeeze(-1)[None, :, None, None]
+            x = x + bx
+            c = c + bc
+        else:
+            # out_per_tau>1이면, 각 τ에 여러 채널 bias를 넣는 구조.
+            # 이 경우 x와 c가 (B,T,H,W)라서 바로 add가 안 되므로,
+            # 보통 x를 (B,T,1,H,W)로 만들거나 1x1 conv로 확장한 뒤 사용해야 함.
+            raise NotImplementedError("out_per_tau>1 requires a different input factorization.")
+
+        return torch.cat([x, c], dim=1)
+
+class PixelTimeCNN(nn.Module):
+    """
+    (B, T, H, W)에 대해 각 (h,w) 위치별로 길이 T의 1D CNN 적용.
+    출력은 (B, T, H, W) (time 길이는 유지).
+    """
+    def __init__(self, T, hidden=32, layers=3, kernel_size=5, dropout=0.0):
+        super().__init__()
+        pads = kernel_size // 2  # non-causal, same length
+        net = []
+        in_ch = 1
+        for li in range(layers):
+            out_ch = hidden if li < layers - 1 else 1
+            net += [
+                nn.Conv1d(in_ch, out_ch, kernel_size, padding=pads),
+                nn.SiLU(),
+                nn.Dropout(dropout) if dropout else nn.Identity()
+            ]
+            in_ch = out_ch
+        self.net = nn.Sequential(*net)
+
+    def forward(self, x):  # x: (B, T, H, W)
+        B, T, H, W = x.shape
+        y = x.permute(0, 2, 3, 1).contiguous().view(B*H*W, 1, T)  # (BHW,1,T)
+        y = self.net(y)                                          # (BHW,1,T)
+        y = y.view(B, H, W, T).permute(0, 3, 1, 2).contiguous()   # (B,T,H,W)
+        return y
+
+class PreUNetTemporalMixer(nn.Module):
+    """
+    x_cat (B,2T,H,W) -> noisy/cond 분리 -> 각각 PixelTCN -> concat -> 1x1 conv로 F채널로 압축
+    """
+    def __init__(self, T, out_channels, tcn_hidden=32, tcn_layers=3, kernel_size=5, dropout=0.0):
+        super().__init__()
+        self.T = T
+        self.tcn_x = PixelTimeCNN(T, hidden=tcn_hidden, layers=tcn_layers, kernel_size=kernel_size, dropout=dropout)
+        self.tcn_c = PixelTimeCNN(T, hidden=tcn_hidden, layers=tcn_layers, kernel_size=kernel_size, dropout=dropout)
+
+        # concat 후 (B,2T,H,W) -> (B,out_channels,H,W)
+        self.merge = nn.Conv2d(2*T, out_channels, kernel_size=1)
+
+    def forward(self, x_cat):
+        B, C, H, W = x_cat.shape
+        T = self.T
+        assert C == 2*T
+
+        x = x_cat[:, :T]     # (B,T,H,W)
+        c = x_cat[:, T:]     # (B,T,H,W)
+
+        x = self.tcn_x(x)
+        c = self.tcn_c(c)
+
+        x_cat2 = torch.cat([x, c], dim=1)  # (B,2T,H,W)
+        return self.merge(x_cat2)          # (B,out_channels,H,W)
+
 class UNet(nn.Module):
     def __init__(self, base_dim=128, dim_mults=(1,2,4),
                  in_channels=1+20, image_size=(H,W), dropout=0.0, groups=32):
         super().__init__()
         self.image_h, self.image_w = image_size
         self.time_dim = base_dim * 4
+
+        # NEW TE PART
+        self.eeg_t = params.data_segment
+        self.tau_enc = TemporalIndexEncoding(eeg_t=self.eeg_t, emb_dim=base_dim, out_per_tau=1)
+
+        # NEW TCN Mixer
+        self.T = params.data_segment
+        self.pre_temporal = PreUNetTemporalMixer(
+            T=self.T, out_channels=base_dim,
+            tcn_hidden=32, tcn_layers=3, kernel_size=5, dropout=dropout
+        )
+
+        # NEW MLP Mixer
+        '''
+        self.pre_mixer = PreUNetMLPMixer(
+            T=self.T,
+            H=self.image_h,
+            W=self.image_w,
+            out_channels=base_dim,   # base_dim으로 압축
+            patch_size=1,            # H,W 나눠떨어지게
+            embed_dim=128,
+            depth=2,
+            token_mlp_dim=256,
+            channel_mlp_dim=512,
+            dropout=dropout,
+            use_tau_bias=True,       # temporal index bias 같이 쓰고 싶으면 True
+            tau_emb_dim=base_dim,
+        )
+        '''
+
+        # NEW Attention Mixer
+        self.pre_attn_temporal = PreUNetTemporalAttnMixer(
+            T=self.T, out_channels=base_dim,
+            d_model=64, heads=4, dropout=dropout
+        )
 
         # self.time_pe  = SinusoidalTimeEmbedding(base_dim)
         # self.time_mlp = nn.Sequential(
@@ -625,28 +809,41 @@ class UNet(nn.Module):
         #     nn.Linear(self.time_dim, self.time_dim)
         # )
         self.time_mlp = TimeMLP(base_dim)
-        self.init = nn.Conv2d(in_channels, base_dim, 3, padding=1)
+        # self.init = nn.Conv2d(in_channels, base_dim, 3, padding=1) # original init
+        # self.init = nn.Conv2d(base_dim, base_dim, 3, padding=1) # NEW TCN Mixer
+        self.init = nn.Identity() # NEW Atten Mixer
 
         self.downs = nn.ModuleList()
         in_ch = base_dim
         skip_channels = []
         for li, m in enumerate(dim_mults):
             out_ch = base_dim * m
-            rb1 = ResnetBlock(in_ch, out_ch, self.time_dim, dropout, groups); self.downs.append(rb1); in_ch = out_ch; skip_channels.append(in_ch)
-            rb2 = ResnetBlock(in_ch, out_ch, self.time_dim, dropout, groups); self.downs.append(rb2); in_ch = out_ch; skip_channels.append(in_ch)
+            if params.use_lstm:
+                use_lstm = (li == 0)
+            else:
+                use_lstm = False
+            rb1 = ResnetBlock(in_ch, out_ch, self.time_dim, dropout, groups,); self.downs.append(rb1); in_ch = out_ch; skip_channels.append(in_ch)
+            rb2 = ResnetBlock(in_ch, out_ch, self.time_dim, dropout, groups,); self.downs.append(rb2); in_ch = out_ch; skip_channels.append(in_ch)
             if li != len(dim_mults) - 1:
                 self.downs.append(nn.Conv2d(in_ch, in_ch, 3, stride=2, padding=1))
 
-        self.mid1 = ResnetBlock(in_ch, in_ch, self.time_dim, dropout, groups)
-        self.mid2 = ResnetBlock(in_ch, in_ch, self.time_dim, dropout, groups)
+        self.mid1 = ResnetBlock(in_ch, in_ch, self.time_dim, dropout, groups,)
+        self.mid2 = ResnetBlock(in_ch, in_ch, self.time_dim, dropout, groups,)
 
         self.ups, self.kinds = nn.ModuleList(), []
         sc = skip_channels.copy()
         for li, m in enumerate(reversed(dim_mults)):
             out_ch = base_dim * m
+
+            if params.use_lstm:
+                orig_li = (num_stages - 1) - li
+                use_lstm = (orig_li == 0)
+            else:
+                use_lstm = False
+
             for _ in range(2):
                 skip_ch = sc.pop()
-                self.ups.append(ResnetBlock(in_ch + skip_ch, out_ch, self.time_dim, dropout, groups)); self.kinds.append('res')
+                self.ups.append(ResnetBlock(in_ch + skip_ch, out_ch, self.time_dim, dropout, groups,)); self.kinds.append('res')
                 in_ch = out_ch
             if li != len(dim_mults) - 1:
                 self.ups.append(nn.Upsample(scale_factor=2, mode='nearest')); self.kinds.append('up')
@@ -656,6 +853,19 @@ class UNet(nn.Module):
 
     def forward(self, x_cat, t):
         # t_emb = self.time_mlp(self.time_pe(t))
+
+        # NEW TE PART
+        # x_cat = self.tau_enc(x_cat)
+
+        # NEW TCN Mixer
+        # x_cat = self.pre_temporal(x_cat)
+
+        # NEW MLP Mixer
+        # x_cat = self.pre_mixer(x_cat)
+
+        # NEW Attn Mixer
+        x_cat = self.pre_attn_temporal(x_cat)
+        
         t_emb = self.time_mlp(t)
         skips, h = [], self.init(x_cat)
         for layer in self.downs:
@@ -1352,7 +1562,7 @@ def load_and_eval(ckpt_path, test_loader):
     diff.eval()
 
     # rmse_raw, rmse_norm, nobs = eval_rmse(diff, test_loader) # FIXME : original eval code
-    rmse_raw, rmse_norm, nobs = eval_rmse_with_pbar(diffusion, test_loader, max_batches=None, show_pbar=True)
+    rmse_raw, rmse_norm, nobs = eval_rmse_with_pbar(diffusion, test_loader, max_batches=500, show_pbar=True)
     # rmse_raw, rmse_norm, nobs = eval_rmse_minibatch(diff, test_loader, max_batches=2)
     # print(f"[BEST] Test RMSE_raw={rmse_raw:.3f} µg/m³ | RMSE_norm={rmse_norm:.3f} (over {nobs} bins)")
     print(f"[BEST] Test RMSE_raw={rmse_raw:.3f} µV (over {nobs} bins)")
