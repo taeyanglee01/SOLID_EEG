@@ -484,10 +484,11 @@ class EEGToGridCtx9_1sec(Dataset):
             with torch.no_grad():
                 z = (full_grid - self.mean) / (self.std + 1e-6)
                 sat = (x0.abs() > 0.98).float().mean().item()
+                '''
                 print(f"[DS] mean={self.mean:.4f} std={self.std:.4f} | "
                     f"z: min={z.min():.2f} max={z.max():.2f} p(|z|>3)={(z.abs()>3).float().mean():.3f} | "
                     f"x0: min={x0.min():.2f} max={x0.max():.2f} sat(|x0|>0.98)={sat:.3f}")
-
+                '''
         # ---- observed subset mask (spatial only) ----
         obs_mask_hw = self._sample_obs_mask(tgt_mask_hw, idx)     # (H,W)
 
@@ -530,6 +531,21 @@ class EEGToGridCtx9_1sec(Dataset):
 
         return x0, loss_mask_hw.unsqueeze(0), cond, self.mean, self.std
 
+class OneInstanceDataset(Dataset):
+    def __init__(self, base_dataset, fixed_idx=0):
+        self.base = base_dataset
+        self.fixed_idx = fixed_idx
+
+        # base에 있는 통계도 그대로 노출 (EEGToGridCtx9_1sec에서 getattr로 읽음)
+        self.mean = float(getattr(base_dataset, "mean", 0.0))
+        self.std  = float(getattr(base_dataset, "std", 1.0))
+
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, _):
+        return self.base[self.fixed_idx]
+
 sample_train_dataset_1sec = Physio_1sec_raw_for_SOLID_from_lmdb(lmdb_dir=params.dataset_dir,
                                                      maxfold=10,
                                                      targetfold=0,
@@ -564,8 +580,53 @@ test_grid_dataset = EEGToGridCtx9_1sec(base_dataset=sample_test_dataset_1sec,
                                         seed=params.seed,
                                         loss_mode='all')
 
-train_loader = DataLoader(train_grid_dataset, batch_size=params.batch_size, shuffle=True, drop_last=True, num_workers=2, pin_memory=True)
-test_loader = DataLoader(test_grid_dataset, batch_size=params.batch_size*2, shuffle=False, drop_last=False, num_workers=2, pin_memory=True)
+fixed_idx = 0  # 원하는 샘플 index로 바꾸기
+
+one_train_base = OneInstanceDataset(sample_train_dataset_1sec, fixed_idx=fixed_idx)
+
+train_grid_dataset = EEGToGridCtx9_1sec(
+    base_dataset=one_train_base,
+    squash_tanh=params.squash_tanh,
+    channel_to_rc=CHANNEL_TO_RC,
+    keep_ratio=params.keep_ratio,
+    seed=params.seed,
+    loss_mode='all'
+)
+
+train_loader = DataLoader(
+    train_grid_dataset,
+    batch_size=1,          # 1 instance면 보통 1로
+    shuffle=False,         # 어차피 len=1이지만 의미상 False 추천
+    drop_last=False,
+    num_workers=0,         # 1샘플이면 0 추천 (재현성/디버그 편함)
+    pin_memory=True
+)
+
+one_test_base = OneInstanceDataset(
+    sample_train_dataset_1sec,   # ⚠️ train dataset 그대로
+    fixed_idx=fixed_idx
+)
+
+test_grid_dataset = EEGToGridCtx9_1sec(
+    base_dataset=one_test_base,
+    squash_tanh=params.squash_tanh,
+    channel_to_rc=CHANNEL_TO_RC,
+    keep_ratio=params.keep_ratio,
+    seed=params.seed,
+    loss_mode='all'
+)
+
+test_loader = DataLoader(
+    test_grid_dataset,
+    batch_size=1,
+    shuffle=False,
+    drop_last=False,
+    num_workers=0,
+    pin_memory=True
+)
+
+# train_loader = DataLoader(train_grid_dataset, batch_size=params.batch_size, shuffle=True, drop_last=True, num_workers=2, pin_memory=True)
+# test_loader = DataLoader(test_grid_dataset, batch_size=params.batch_size*2, shuffle=False, drop_last=False, num_workers=2, pin_memory=True)
 
 
 print(len(train_grid_dataset))
@@ -1804,64 +1865,128 @@ print("Done. Best Test RMSE_raw:", best_rmse)
 # ============================================================
 # 9) Inference + overlay: GT vs Pred (only observed bins)
 # ============================================================
-def overlay_panel(test_loader, model, save_path=os.path.join(params.result_dir, 'ctx9_overlay.png'),
-                  back_img='./airdelhi_background.png'):
+def overlay_panel(
+    loader,
+    model,
+    save_path=os.path.join(params.result_dir, "ctx9_overlay_1inst.png"),
+    back_img="./airdelhi_background.png",
+    use_loss_mask=True,     # True면 loss_mask 영역만 표시, False면 electrode bins 전체(tgt_mask) 표시하려면 loader가 그걸 줘야 함
+):
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as colors
+    from matplotlib.colors import LinearSegmentedColormap
+
+    # background
     try:
         back = plt.imread(back_img)
     except:
         back = None
 
-    import matplotlib.colors as colors
-    from matplotlib.colors import LinearSegmentedColormap
-    cmap0 = LinearSegmentedColormap.from_list('', ['white', 'orange', 'red'])
-    cmap0 = cmap0.copy()
-    cmap0.set_bad(color='lightgray')
+    cmap0 = LinearSegmentedColormap.from_list("", ["white", "orange", "red"]).copy()
+    cmap0.set_bad(color="lightgray")
+
+    def to_bhw(x):
+        """
+        x를 (B,H,W)로 맞춘 뒤 B=1만 반환 -> (H,W)
+        허용:
+          (B,L,H,W), (B,1,L,H,W), (B,H,W), (B,1,H,W)
+        """
+        if not torch.is_tensor(x):
+            x = torch.as_tensor(x)
+
+        # (B,1,L,H,W) -> (B,L,H,W)
+        if x.dim() == 5:
+            x = x[:, 0]
+
+        # (B,1,H,W) -> (B,H,W)
+        if x.dim() == 4 and x.size(1) == 1 and x.size(-2) == H and x.size(-1) == W:
+            x = x[:, 0]
+
+        # (B,L,H,W) -> mid time -> (B,H,W)
+        if x.dim() == 4 and x.size(-2) == H and x.size(-1) == W:
+            L = x.size(1)
+            x = x[:, L // 2]
+
+        # (B,H,W)
+        if x.dim() != 3:
+            raise ValueError(f"Unexpected shape after normalize: {tuple(x.shape)}")
+
+        return x[0]  # (H,W)
 
     with torch.inference_mode():
-        xb, mb, cb, mub, stdb = next(iter(test_loader))
-        xhat = model.sample(cb.to(DEVICE), clip=True).cpu()  # tanh(z)
+        batch = next(iter(loader))
+        # 기대: (x0, loss_mask(1,H,W), cond, mean, std)
+        xb, loss_mask_b1hw, cb, mub, stdb = batch
+
+        # 1-instance만 사용: (H,W) 한 장
+        # model.sample 입력
+        xhat = model.sample(cb.to(DEVICE), clip=True).cpu()
 
         if params.squash_tanh:
-            raw_hat = inv_tanh_to_raw(xhat, mub[:,None,None,None], stdb[:,None,None,None]).squeeze(1)
-            raw_gt  = inv_tanh_to_raw(xb,   mub[:,None,None,None], stdb[:,None,None,None]).squeeze(1)
+            # inv_tanh_to_raw가 (B,L,H,W) 또는 (B,1,L,H,W) 등 무엇을 반환하든
+            raw_hat = inv_tanh_to_raw(xhat, mub[:, None, None, None], stdb[:, None, None, None])
+            raw_gt  = inv_tanh_to_raw(xb,   mub[:, None, None, None], stdb[:, None, None, None])
         else:
-            raw_hat = xhat.squeeze(1)
-            raw_hat = raw_hat*params.data_scaling_factor
-            raw_gt = xb.squeeze(1)
-            raw_gt = raw_gt*params.data_scaling_factor
+            raw_hat = xhat * params.data_scaling_factor
+            raw_gt  = xb   * params.data_scaling_factor
 
-        t0 = xhat.size(1)//2
-        raw_hat = raw_hat[:,t0]
-        raw_gt = raw_gt[:,t0]
-        mb      = mb.squeeze(1)
+        raw_hat_hw = to_bhw(raw_hat)  # (H,W)
+        raw_gt_hw  = to_bhw(raw_gt)   # (H,W)
 
-    # vmax = float(mub.mean() + 3*stdb.mean())
-    vmax = np.nanpercentile(raw_gt.numpy(), 99)
-    lon_edges = np.linspace(0,1,W+1); lat_edges = np.linspace(0,1,H+1)
+        # loss_mask: (B,1,H,W) -> (H,W)
+        if torch.is_tensor(loss_mask_b1hw):
+            if loss_mask_b1hw.dim() == 4 and loss_mask_b1hw.size(1) == 1:
+                show_mask_hw = loss_mask_b1hw[0, 0]
+            elif loss_mask_b1hw.dim() == 3:
+                show_mask_hw = loss_mask_b1hw[0]
+            else:
+                raise ValueError(f"Unexpected loss_mask shape: {tuple(loss_mask_b1hw.shape)}")
+        else:
+            show_mask_hw = torch.as_tensor(loss_mask_b1hw)[0, 0]
 
-    B = min(8, raw_hat.size(0))
-    fig, axes = plt.subplots(2, B, figsize=(3.4*B, 6.8))
-    for i in range(B):
-        for row, arr in enumerate([raw_gt[i].numpy(), raw_hat[i].numpy()]):
-            ax = axes[row, i]
-            if back is not None: ax.imshow(back, extent=[0,1,0,1], alpha=0.6)
-            mask = (mb[i].numpy() == 0)
-            arr_plot = np.ma.array(arr, mask=mask)
-            # arr_plot = arr.copy()
-            # arr_plot[mb[i].numpy() == 0] = np.nan  # show only observed bins
-            pm = ax.pcolormesh(lon_edges, lat_edges, arr_plot, cmap=cmap0,
-                               norm=colors.Normalize(vmin=0, vmax=vmax))
-            # draw grid
-            for y in lat_edges: ax.plot([0,1],[y,y], c='k', lw=0.1)
-            for x in lon_edges: ax.plot([x,x],[0,1], c='k', lw=0.1)
-            ax.set_axis_off()
-        axes[0, i].set_title("GT (obs bins)", fontsize=11)
-        axes[1, i].set_title("Pred (obs bins)", fontsize=11)
+        show_mask_hw = show_mask_hw.cpu().numpy()
+
+    # plotting 범위
+    vmax = np.nanpercentile(raw_gt_hw.cpu().numpy(), 99)
+    lon_edges = np.linspace(0, 1, W + 1)
+    lat_edges = np.linspace(0, 1, H + 1)
+
+    fig, axes = plt.subplots(2, 1, figsize=(6.5, 10.5))
+
+    for ax, title, arr in [
+        (axes[0], "GT (masked bins)",   raw_gt_hw.cpu().numpy()),
+        (axes[1], "Pred (masked bins)", raw_hat_hw.cpu().numpy()),
+    ]:
+        if back is not None:
+            ax.imshow(back, extent=[0, 1, 0, 1], alpha=0.6)
+
+        # mask==0은 가리기
+        arr_plot = np.ma.array(arr, mask=(show_mask_hw == 0))
+
+        pm = ax.pcolormesh(
+            lon_edges, lat_edges, arr_plot,
+            cmap=cmap0,
+            norm=colors.Normalize(vmin=0, vmax=vmax),
+        )
+
+        # grid lines
+        for y in lat_edges:
+            ax.plot([0, 1], [y, y], c="k", lw=0.1)
+        for x in lon_edges:
+            ax.plot([x, x], [0, 1], c="k", lw=0.1)
+
+        ax.set_title(title, fontsize=12)
+        ax.set_axis_off()
 
     cbar = fig.colorbar(pm, ax=axes.ravel().tolist(), fraction=0.03, pad=0.02)
     cbar.ax.tick_params(labelsize=10)
-    plt.tight_layout(); plt.savefig(save_path, dpi=140, bbox_inches='tight'); plt.close(fig)
-    print("Saved overlays to:", save_path)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print("Saved 1-inst overlay to:", save_path)
+
 
 import os, math
 import numpy as np
