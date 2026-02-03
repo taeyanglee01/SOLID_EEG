@@ -24,7 +24,8 @@ cd /pscratch/sd/t/tylee/SOLID_EEG
 # python Physio_1frame_modelsearchCNN.py \
 # python Physio_1frame_modelsearch_factorized.py \
 # python Physio_1frame_modelsearchCNN_3D.py \
-python Physio_1frame_modelsearchCNN_1inst.py \
+# python Physio_1frame_modelsearch_factorized_1inst.py
+python Physio_1frame_modelsearch_factorized_1inst.py \
     --seed 41 \
     --batch_size 32 \
     --dmodel 128 \
@@ -32,7 +33,7 @@ python Physio_1frame_modelsearchCNN_1inst.py \
     --max_lr 4e-5 \
     --min_lr 8e-7 \
     --wd 1e-4 \
-    --result_dir /pscratch/sd/t/tylee/SOLID_EEG_RESULT/physio_0121_check4OneInst_keepratio10_stride10_50000iter \
+    --result_dir /pscratch/sd/t/tylee/SOLID_EEG_RESULT/physio_0126_check10OneInst_keepratio10_stride10_50000iter_AttnUNetSpatTemp \
     --dataset_dir /pscratch/sd/t/tylee/Dataset/PhysioNet_200Hz_lowpass40_for_SOLID \
     --squash_tanh True \
     --keep_ratio 1.0 \

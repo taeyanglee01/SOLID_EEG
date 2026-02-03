@@ -1230,13 +1230,13 @@ class UNet(nn.Module):
                 use_lstm = (li == 0)
             else:
                 use_lstm = False
-            rb1 = ResnetBlock(in_ch, out_ch, self.time_dim, dropout, groups,); self.downs.append(rb1); in_ch = out_ch; skip_channels.append(in_ch)
-            rb2 = ResnetBlock(in_ch, out_ch, self.time_dim, dropout, groups,); self.downs.append(rb2); in_ch = out_ch; skip_channels.append(in_ch)
+            rb1 = ResnetBlock_withLSTM(in_ch, out_ch, self.time_dim, dropout, groups,); self.downs.append(rb1); in_ch = out_ch; skip_channels.append(in_ch)
+            rb2 = ResnetBlock_withLSTM(in_ch, out_ch, self.time_dim, dropout, groups,); self.downs.append(rb2); in_ch = out_ch; skip_channels.append(in_ch)
             if li != len(dim_mults) - 1:
                 self.downs.append(nn.Conv2d(in_ch, in_ch, 3, stride=2, padding=1))
 
-        self.mid1 = ResnetBlock(in_ch, in_ch, self.time_dim, dropout, groups,)
-        self.mid2 = ResnetBlock(in_ch, in_ch, self.time_dim, dropout, groups,)
+        self.mid1 = ResnetBlock_withLSTM(in_ch, in_ch, self.time_dim, dropout, groups,)
+        self.mid2 = ResnetBlock_withLSTM(in_ch, in_ch, self.time_dim, dropout, groups,)
 
         self.ups, self.kinds = nn.ModuleList(), []
         sc = skip_channels.copy()
@@ -1251,7 +1251,7 @@ class UNet(nn.Module):
 
             for _ in range(2):
                 skip_ch = sc.pop()
-                self.ups.append(ResnetBlock(in_ch + skip_ch, out_ch, self.time_dim, dropout, groups,)); self.kinds.append('res')
+                self.ups.append(ResnetBlock_withLSTM(in_ch + skip_ch, out_ch, self.time_dim, dropout, groups,)); self.kinds.append('res')
                 in_ch = out_ch
             if li != len(dim_mults) - 1:
                 self.ups.append(nn.Upsample(scale_factor=2, mode='nearest')); self.kinds.append('up')
@@ -1304,7 +1304,7 @@ class UNet(nn.Module):
             exit()
             
         for layer in self.downs:
-            if isinstance(layer, ResnetBlock):
+            if isinstance(layer, ResnetBlock_withLSTM):
                 h = layer(h, t_emb); skips.append(h)
             else:
                 h = layer(h)

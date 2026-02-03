@@ -81,7 +81,7 @@ selected_channels = ['Fc5.', 'Fc3.', 'Fc1.', 'Fcz.', 'Fc2.', 'Fc4.', 'Fc6.', 'C5
                      'P3..', 'P1..', 'Pz..', 'P2..', 'P4..', 'P6..', 'P8..', 'Po7.', 'Po3.', 'Poz.', 'Po4.', 'Po8.',
                      'O1..', 'Oz..', 'O2..', 'Iz..']
 
-db = lmdb.open('/pscratch/sd/t/tylee/Dataset/PhysioNet_200Hz_lowpass40_for_SOLID', map_size=12614542346)
+db = lmdb.open('/pscratch/sd/t/tylee/Dataset/PhysioNet_200Hz_high01_lowpassNone_for_SOLID', map_size=12614542346)
 
 # ELC 파일 경로
 elc_file = "/pscratch/sd/t/tylee/standard_1005.elc"
@@ -125,7 +125,7 @@ for file in files:
         original_sampling_rate = int(raw.info['sfreq'])
 
         raw.set_eeg_reference(ref_channels='average')
-        raw.filter(l_freq=0.3, h_freq=40)
+        raw.filter(l_freq=0.1, h_freq=None)
         raw.notch_filter((60))
         raw.resample(200)  # set resample rate
 

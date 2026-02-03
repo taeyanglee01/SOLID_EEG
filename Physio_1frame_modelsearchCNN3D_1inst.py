@@ -55,6 +55,7 @@ def get_parser_args(parser):
     parser.add_argument('--squash_tanh', type=str2bool, default=True, help='tanh normalization')
     parser.add_argument('--data_scaling_factor', type=int, default=100, help='scaling factor for data')
     parser.add_argument('--data_segment', type=int, default=1, help='number of data segment time points')
+    parser.add_argument('--three_d_unet', type=str2bool, default=False, help='use 3d cnn based 3d unet')
     parser.add_argument('--use_lstm', type=str2bool, default=False, help='add lstm in resnet')
     parser.add_argument('--use_wavelet_loss', type=str2bool, default=False, help='use wavelet loss')
     parser.add_argument('--wavelet_loss_weight', type=float, default=0.1, help='wavelet loss weight')

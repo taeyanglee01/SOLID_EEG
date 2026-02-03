@@ -484,11 +484,10 @@ class EEGToGridCtx9_1sec(Dataset):
             with torch.no_grad():
                 z = (full_grid - self.mean) / (self.std + 1e-6)
                 sat = (x0.abs() > 0.98).float().mean().item()
-                '''
-                print(f"[DS] mean={self.mean:.4f} std={self.std:.4f} | "
-                    f"z: min={z.min():.2f} max={z.max():.2f} p(|z|>3)={(z.abs()>3).float().mean():.3f} | "
-                    f"x0: min={x0.min():.2f} max={x0.max():.2f} sat(|x0|>0.98)={sat:.3f}")
-                '''
+                # print(f"[DS] mean={self.mean:.4f} std={self.std:.4f} | "
+                #     f"z: min={z.min():.2f} max={z.max():.2f} p(|z|>3)={(z.abs()>3).float().mean():.3f} | "
+                #     f"x0: min={x0.min():.2f} max={x0.max():.2f} sat(|x0|>0.98)={sat:.3f}")
+
         # ---- observed subset mask (spatial only) ----
         obs_mask_hw = self._sample_obs_mask(tgt_mask_hw, idx)     # (H,W)
 
@@ -636,148 +635,6 @@ print(len(test_grid_dataset))
 
 print("MODEL SETTING RUNNING")
 
-def simple_haar_dwt_1d(x, dim=1):
-    if x.shape[dim] % 2 != 0:
-        x = x.narrow(dim, 0, x.shape[dim] - 1)
-
-    idx_even = [slice(None)] * x.ndim
-    idx_even[dim] = slice(0, None, 2)
-
-    idx_odd = [slice(None)] * x.ndim
-    idx_odd[dim] = slice(1, None, 2)
-
-    even = x[tuple(idx_even)]
-    odd = x[tuple(idx_odd)]
-
-    approx = (even + odd) * 0.70710678
-    detail = (even - odd) * 0.70710678
-
-    return approx, detail
-
-def spectral_loss_1d(x_gt, x_pred, dim=2, eps=1e-8):
-    """
-    Compute spectral loss using FFT along temporal dimension.
-
-    Args:
-        x_gt: (B, C, T, H, W) ground truth
-        x_pred: (B, C, T, H, W) prediction
-        dim: temporal dimension (default 2)
-        eps: small constant for numerical stability
-
-    Returns:
-        Magnitude loss + Phase loss (weighted)
-    """
-    # FFT along temporal dimension
-    fft_gt = torch.fft.rfft(x_gt, dim=dim)
-    fft_pred = torch.fft.rfft(x_pred, dim=dim)
-
-    # Magnitude (amplitude) loss
-    mag_gt = torch.abs(fft_gt)
-    mag_pred = torch.abs(fft_pred)
-    mag_loss = F.l1_loss(mag_pred, mag_gt, reduction='none')
-
-    # Phase loss (more robust with cosine similarity)
-    # Normalize to unit vectors for phase comparison
-    fft_gt_norm = fft_gt / (torch.abs(fft_gt) + eps)
-    fft_pred_norm = fft_pred / (torch.abs(fft_pred) + eps)
-
-    # Cosine distance = 1 - cosine_similarity
-    # Real part of normalized product gives cosine of phase difference
-    phase_similarity = (fft_gt_norm * torch.conj(fft_pred_norm)).real
-    phase_loss = 1.0 - phase_similarity
-
-    # Combine: magnitude is more important than phase for EEG
-    total_loss = mag_loss + 0.5 * phase_loss
-
-    return total_loss
-
-# ============================================================
-# 2.5) Perceptual Feature Extractor for EEG
-# ============================================================
-class EEGFeatureExtractor(nn.Module):
-    """
-    Lightweight feature extractor for perceptual loss.
-    Uses multi-scale 3D convolutions to extract hierarchical features.
-    """
-    def __init__(self, in_channels=1):
-        super().__init__()
-        # Multi-scale feature extraction
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(in_channels, 16, kernel_size=3, padding=1),
-            nn.GroupNorm(4, 16),
-            nn.ReLU(inplace=True)
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 32),
-            nn.ReLU(inplace=True)
-        )
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.GroupNorm(16, 64),
-            nn.ReLU(inplace=True)
-        )
-
-        # Initialize to pretrained-like behavior
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-    def forward(self, x):
-        """
-        Args:
-            x: (B, T, H, W)
-        Returns:
-            features: list of [(B, 16, T, H, W), (B, 32, T/2, H/2, W/2), (B, 64, T/2, H/2, W/2)]
-        """
-        feat1 = self.conv1(x)
-        feat2 = self.conv2(feat1)
-        feat3 = self.conv3(feat2)
-        return [feat1, feat2, feat3]
-
-def perceptual_loss_2d(x_gt, x_pred, feature_extractor, mask=None):
-    """
-    Compute perceptual loss using multi-scale features.
-
-    Args:
-        x_gt: (B, T, H, W) ground truth
-        x_pred: (B, T, H, W) prediction
-        feature_extractor: EEGFeatureExtractor
-        mask: (B, 1, H, W) optional spatial mask
-
-    Returns:
-        Weighted sum of feature distances at multiple scales
-    """
-    with torch.no_grad():
-        feats_gt = feature_extractor(x_gt)
-
-    feats_pred = feature_extractor(x_pred)
-
-    total_loss = 0.0
-    weights = [1.0, 0.5, 0.25]  # Higher weight for lower-level features
-
-    for feat_gt, feat_pred, weight in zip(feats_gt, feats_pred, weights):
-        # L1 loss in feature space
-        diff = torch.abs(feat_gt - feat_pred)
-
-        # Apply mask if provided (downsample mask to match feature resolution)
-        if mask is not None and feat_gt.shape[-2:] != mask.shape[-2:]:
-            # Downsample mask
-            B, T, H, W = feat_gt.shape
-            # import pdb;pdb.set_trace()
-            mask_down = F.adaptive_avg_pool2d(mask, (H, W))  # (B, H, W)
-            mask_down = mask_down.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, H, W)
-            diff = diff * (mask_down > 0.5).float()
-
-        total_loss += weight * diff.mean()
-
-    return total_loss
-
 # ============================================================
 # 3) UNet (no attention; rectangular-friendly)
 # ============================================================
@@ -837,7 +694,204 @@ class ResnetBlock_withLSTM(nn.Module):
         h = self.conv2(self.dropout(self.act(self.norm2(h))))
         return h + self.res(x)
 
+class ResnetBlock_withAttention(nn.Module):
+    def __init__(self, dim, dim_out=None, time_emb_dim=None, dropout=0.0, groups=32, 
+                    use_lstm=False, T=None, lstm_hidden=64, lstm_groups=8):
+        super().__init__()
+        dim_out = dim if dim_out is None else dim_out
+        self.mlp = nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, dim_out)) if time_emb_dim else None
+        self.norm1 = nn.GroupNorm(groups, dim);     self.conv1 = nn.Conv2d(dim, dim_out, 3, padding=1)
+        self.norm2 = nn.GroupNorm(groups, dim_out); self.conv2 = nn.Conv2d(dim_out, dim_out, 3, padding=1)
+        self.dropout = nn.Dropout(dropout) if dropout else nn.Identity()
+        self.act = nn.SiLU()
+        self.res = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
+        self.use_lstm = use_lstm
+        if use_lstm:
+            assert T is not None, "Need T=params.data_segment for LSTM temporal mixing"
+            # dim_out이 T 배수가 아닐 가능성이 높아서 in/out proj로 맞추는 버전 사용
+            self.temporal = PixelTimeLSTM(
+                T=T,
+                hidden=lstm_hidden,
+                num_layers=1,
+                dropout=dropout,
+                use_in_proj=True,
+                in_channels=dim_out,
+                group_channels=lstm_groups
+            )
+            # gating (optional): 너무 세게 들어오면 학습 불안정 -> 게이트로 조절
+            self.gate = nn.Parameter(torch.tensor(0.0))  # 시작은 거의 0 (안 켠 것처럼)
+        else:
+            self.temporal = None
+            self.gate = None
+    def forward(self, x, t_emb=None):
+        h = self.conv1(self.act(self.norm1(x)))
+        if self.mlp is not None and t_emb is not None:
+            h = h + self.mlp(t_emb)[..., None, None]
+        if self.temporal is not None: # use lstm ver
+            h = h + torch.tanh(self.gate) * self.temporal(h)
+        h = self.conv2(self.dropout(self.act(self.norm2(h))))
+        return h + self.res(x)
+
+class _TemporalAttnOverT(nn.Module):
+    """
+    x: [B, D, T, H, W]  -> temporal attention over T for each (H,W)
+    """
+    def __init__(self, d, heads=4, dim_head=32, dropout=0.0, groups=8):
+        super().__init__()
+        inner = heads * dim_head
+        self.heads = heads
+        self.dim_head = dim_head
+
+        self.norm = nn.GroupNorm(groups, d)
+        self.to_qkv = nn.Conv1d(d, inner * 3, 1, bias=False)
+        self.to_out = nn.Conv1d(inner, d, 1, bias=False)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, D, T, H, W = x.shape
+        # (B*H*W, D, T)
+        y = x.permute(0, 3, 4, 1, 2).contiguous().view(B * H * W, D, T)
+        y = self.norm(y)
+        q, k, v = self.to_qkv(y).chunk(3, dim=1)  # (N, inner, T)
+
+        N = q.shape[0]
+        q = q.view(N, self.heads, self.dim_head, T).permute(0, 1, 3, 2)  # (N,h,T,dh)
+        k = k.view(N, self.heads, self.dim_head, T).permute(0, 1, 3, 2)
+        v = v.view(N, self.heads, self.dim_head, T).permute(0, 1, 3, 2)
+
+        scale = self.dim_head ** -0.5
+        attn = (q @ k.transpose(-1, -2)) * scale
+        attn = self.drop(attn.softmax(dim=-1))
+        out = attn @ v  # (N,h,T,dh)
+
+        out = out.permute(0, 1, 3, 2).contiguous().view(N, self.heads * self.dim_head, T)
+        out = self.to_out(out)  # (N, D, T)
+
+        out = out.view(B, H, W, D, T).permute(0, 3, 4, 1, 2).contiguous()  # [B,D,T,H,W]
+        return out
+
+
+class _SpatialAttnOverHW(nn.Module):
+    """
+    x: [B, D, T, H, W] -> spatial attention over HW for each t
+    """
+    def __init__(self, d, heads=4, dim_head=32, dropout=0.0, groups=8):
+        super().__init__()
+        inner = heads * dim_head
+        self.heads = heads
+        self.dim_head = dim_head
+
+        self.norm = nn.GroupNorm(groups, d)
+        self.to_qkv = nn.Conv1d(d, inner * 3, 1, bias=False)
+        self.to_out = nn.Conv1d(inner, d, 1, bias=False)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, D, T, H, W = x.shape
+        S = H * W
+        # (B*T, D, S)
+        y = x.permute(0, 2, 1, 3, 4).contiguous().view(B * T, D, S)
+        y = self.norm(y)
+        q, k, v = self.to_qkv(y).chunk(3, dim=1)
+
+        N = q.shape[0]  # B*T
+        q = q.view(N, self.heads, self.dim_head, S).permute(0, 1, 3, 2)  # (N,h,S,dh)
+        k = k.view(N, self.heads, self.dim_head, S).permute(0, 1, 3, 2)
+        v = v.view(N, self.heads, self.dim_head, S).permute(0, 1, 3, 2)
+
+        scale = self.dim_head ** -0.5
+        attn = (q @ k.transpose(-1, -2)) * scale
+        attn = self.drop(attn.softmax(dim=-1))
+        out = attn @ v  # (N,h,S,dh)
+
+        out = out.permute(0, 1, 3, 2).contiguous().view(N, self.heads * self.dim_head, S)
+        out = self.to_out(out)  # (N, D, S)
+
+        out = out.view(B, T, D, H, W).permute(0, 2, 1, 3, 4).contiguous()  # [B,D,T,H,W]
+        return out
+
+
+class ResnetBlock_STAttn2D(nn.Module):
+    def __init__(
+        self,
+        dim, dim_out=None, time_emb_dim=None,
+        dropout=0.0, groups=4,
+        T=200, d_model=64, heads=4, dim_head=4,
+        attn_groups=2,
+        use_temporal_attn=True,
+        use_spatial_attn=True,
+        gate_init=0.0,
+        split_temporal=True,   # <-- 추가
+    ):
+        super().__init__()
+        dim_out = dim if dim_out is None else dim_out
+
+        self.mlp = nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, dim_out)) if time_emb_dim else None
+
+        self.norm1 = nn.GroupNorm(groups, dim)
+        self.conv1 = nn.Conv2d(dim, dim_out, 3, padding=1)
+
+        self.norm2 = nn.GroupNorm(groups, dim_out)
+        self.conv2 = nn.Conv2d(dim_out, dim_out, 3, padding=1)
+
+        self.dropout = nn.Dropout(dropout) if dropout else nn.Identity()
+        self.act = nn.SiLU()
+        self.res = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
+
+        # ---- ST attention bridge ----
+        self.T_half = T                 # noisy T, cond T
+        self.T_total = 2 * T            # 실제 시간축 길이
+        self.d_model = d_model
+        self.split_temporal = split_temporal
+
+        self.to_st = nn.Conv2d(dim_out, d_model * self.T_total, 1)
+        self.from_st = nn.Conv2d(d_model * self.T_total, dim_out, 1)
+
+        self.temporal_attn = (
+            _TemporalAttnOverT(d_model, heads=heads, dim_head=dim_head, dropout=dropout, groups=attn_groups)
+            if use_temporal_attn else None
+        )
+        self.spatial_attn = (
+            _SpatialAttnOverHW(d_model, heads=heads, dim_head=dim_head, dropout=dropout, groups=attn_groups)
+            if use_spatial_attn else None
+        )
+
+        self.temporal_gate = nn.Parameter(torch.tensor(gate_init)) if use_temporal_attn else None
+        self.spatial_gate  = nn.Parameter(torch.tensor(gate_init)) if use_spatial_attn else None
+
+    def forward(self, x, t_emb=None):
+        # import pdb;pdb.set_trace()
+        h = self.conv1(self.act(self.norm1(x)))
+
+        if self.mlp is not None and t_emb is not None:
+            h = h + self.mlp(t_emb)[..., None, None]
+
+        B, C, H, W = h.shape
+
+        # h_st: [B, D, 2T, H, W]
+        h_st = self.to_st(h).view(B, self.d_model, self.T_total, H, W)
+
+        # ---- temporal attention (split: noisy / cond) ----
+        if self.temporal_attn is not None:
+            if self.split_temporal:
+                noisy, cond = h_st.split(self.T_half, dim=2)  # dim=2 is time
+                noisy = noisy + torch.tanh(self.temporal_gate) * self.temporal_attn(noisy)
+                cond  = cond  + torch.tanh(self.temporal_gate) * self.temporal_attn(cond)
+                h_st = torch.cat([noisy, cond], dim=2)
+            else:
+                h_st = h_st + torch.tanh(self.temporal_gate) * self.temporal_attn(h_st)
+
+        # ---- spatial attention (그대로, 2T 각각의 프레임에 대해 HW attn) ----
+        if self.spatial_attn is not None:
+            h_st = h_st + torch.tanh(self.spatial_gate) * self.spatial_attn(h_st)
+
+        # back to [B, dim_out, H, W]
+        h = self.from_st(h_st.view(B, self.d_model * self.T_total, H, W))
+
+        h = self.conv2(self.dropout(self.act(self.norm2(h))))
+        return h + self.res(x)
+    
 class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, base_dim):
         super().__init__()
@@ -971,194 +1025,6 @@ class PreUNetTemporalMixer(nn.Module):
         x_cat2 = torch.cat([x, c], dim=1)  # (B,2T,H,W)
         return self.merge(x_cat2)          # (B,out_channels,H,W)
 
-@torch.no_grad()
-def _save_tensor_debug(tag, z, outdir="debug_init", max_channels=4, b=0):
-    """
-    z: (B,C,H,W)
-    저장:
-      - 통계 txt
-      - 히스토그램 png
-      - 채널별 std plot png
-      - feature map 몇 장 png
-      - 원하면 텐서 자체 pt로도 저장
-    """
-    os.makedirs(outdir, exist_ok=True)
-
-    zc = z.detach().float().cpu()
-    B, C, H, W = zc.shape
-
-    # 1) stats
-    per_ch_std = zc.std(dim=(0,2,3))
-    per_ch_mean = zc.mean(dim=(0,2,3))
-    stats_path = os.path.join(outdir, f"{tag}_stats.txt")
-    with open(stats_path, "w") as f:
-        f.write(f"shape={tuple(z.shape)}\n")
-        f.write(f"global mean={zc.mean().item():.6f}, global std={zc.std().item():.6f}\n")
-        f.write(f"per-ch mean: mean={per_ch_mean.mean().item():.6f}, std={per_ch_mean.std().item():.6f}\n")
-        f.write(f"per-ch std : min={per_ch_std.min().item():.6f}, max={per_ch_std.max().item():.6f}, "
-                f"mean={per_ch_std.mean().item():.6f}, std={per_ch_std.std().item():.6f}\n")
-
-    # 2) histogram
-    plt.figure()
-    plt.hist(zc.flatten().numpy(), bins=80)
-    plt.title(f"{tag} histogram")
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, f"{tag}_hist.png"))
-    plt.close()
-
-    # 3) per-channel std plot
-    plt.figure()
-    plt.plot(per_ch_std.numpy())
-    plt.title(f"{tag} per-channel std")
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, f"{tag}_chstd.png"))
-    plt.close()
-
-    # 4) feature maps (몇 채널만)
-    chs = list(range(min(max_channels, C)))
-    plt.figure(figsize=(3*len(chs), 3))
-    for i, c in enumerate(chs):
-        plt.subplot(1, len(chs), i+1)
-        plt.imshow(zc[b, c], aspect="auto")
-        plt.title(f"{tag} ch={c}")
-        plt.axis("off")
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, f"{tag}_maps.png"))
-    plt.close()
-
-    # 5) tensor 저장(원하면 켜기)
-    torch.save(z.detach().cpu(), os.path.join(outdir, f"{tag}.pt"))
-
-@torch.no_grad()
-def viz_time_shuffle_sensitivity(make_z, x_bt_hw, outdir="debug_time", n_trials=8, b=0):
-    """
-    make_z: (x)-> z 를 만드는 함수. z는 (B,C,H,W) 기대
-            예) lambda x: self.init(self.pre_mixer(x))
-            예) lambda x: self.pre_mixer(x)
-    x_bt_hw: (B,T,H,W)
-    """
-    os.makedirs(outdir, exist_ok=True)
-
-    z_ref = make_z(x_bt_hw)  # (B,C,H,W)
-    z_ref_flat = z_ref[b].flatten()  # (C*H*W,)
-
-    rel_diffs = []
-    for _ in range(n_trials):
-        perm = torch.randperm(x_bt_hw.shape[1], device=x_bt_hw.device)
-        x_shuf = x_bt_hw[:, perm]
-        z_shuf = make_z(x_shuf)
-        z_shuf_flat = z_shuf[b].flatten()
-
-        # 상대 L2 차이
-        num = (z_ref_flat - z_shuf_flat).pow(2).mean().sqrt()
-        den = z_ref_flat.pow(2).mean().sqrt() + 1e-8
-        rel = (num / den).item()
-        rel_diffs.append(rel)
-
-    # 시각화: rel diff bar
-    plt.figure()
-    plt.bar(list(range(len(rel_diffs))), rel_diffs)
-    plt.title("Time-shuffle sensitivity (relative diff)")
-    plt.xlabel("trial")
-    plt.ylabel("rel L2 diff")
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, "time_shuffle_rel_diff.png"))
-    plt.close()
-
-    # 텍스트 저장
-    with open(os.path.join(outdir, "time_shuffle_rel_diff.txt"), "w") as f:
-        f.write(str(rel_diffs) + "\n")
-        f.write(f"mean={sum(rel_diffs)/len(rel_diffs):.6f}\n")
-
-    return rel_diffs
-
-@torch.no_grad()
-def viz_tau_impulse_fingerprint(make_z, x_bt_hw, taus=None, outdir="debug_time", b=0):
-    """
-    make_z: (x)-> z , z: (B,C,H,W)
-    x_bt_hw: (B,T,H,W)
-    taus: 확인할 tau 리스트. None이면 균일 샘플링
-    """
-    os.makedirs(outdir, exist_ok=True)
-    B,T,H,W = x_bt_hw.shape
-
-    if taus is None:
-        # T가 크면 너무 많으니까 12개 정도만 균일 샘플
-        k = min(12, T)
-        taus = torch.linspace(0, T-1, steps=k).long().tolist()
-
-    # tau별 출력 벡터 수집
-    Z = []
-    for tau in taus:
-        x_imp = torch.zeros_like(x_bt_hw)
-        x_imp[:, tau] = x_bt_hw[:, tau]   # 해당 tau slice만 남김
-        z_tau = make_z(x_imp)[b].flatten() # (C*H*W,)
-        z_tau = F.normalize(z_tau, dim=0)
-        Z.append(z_tau)
-
-    Z = torch.stack(Z, dim=0)  # (K, D)
-    sim = (Z @ Z.t()).detach().cpu()  # cosine sim (K,K)
-
-    # similarity matrix plot
-    plt.figure(figsize=(6,5))
-    plt.imshow(sim, aspect="auto")
-    plt.colorbar()
-    plt.title("Tau-impulse fingerprint (cosine similarity)")
-    plt.xticks(range(len(taus)), taus, rotation=45)
-    plt.yticks(range(len(taus)), taus)
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, "tau_impulse_similarity.png"))
-    plt.close()
-
-    # 저장
-    torch.save({"taus": taus, "sim": sim}, os.path.join(outdir, "tau_impulse_similarity.pt"))
-    return taus, sim
-
-@torch.no_grad()
-def viz_temporal_pattern_sensitivity(make_z, x_bt_hw, outdir="debug_time", b=0):
-    """
-    같은 프레임 집합이라도 시간 순서/패턴만 바꿨을 때 출력이 달라지는지 확인
-    """
-    os.makedirs(outdir, exist_ok=True)
-    B,T,H,W = x_bt_hw.shape
-
-    # 원본
-    z_ref = make_z(x_bt_hw)[b].flatten()
-
-    # reverse time
-    z_rev = make_z(torch.flip(x_bt_hw, dims=[1]))[b].flatten()
-
-    # cyclic shift
-    shift = max(1, T//4)
-    z_shift = make_z(torch.roll(x_bt_hw, shifts=shift, dims=1))[b].flatten()
-
-    # pairwise relative diffs
-    def rel(a,b):
-        num = (a-b).pow(2).mean().sqrt()
-        den = a.pow(2).mean().sqrt() + 1e-8
-        return (num/den).item()
-
-    vals = {
-        "reverse_vs_ref": rel(z_rev, z_ref),
-        "shift_vs_ref": rel(z_shift, z_ref),
-    }
-
-    # bar plot
-    plt.figure()
-    plt.bar(list(vals.keys()), list(vals.values()))
-    plt.xticks(rotation=30, ha="right")
-    plt.ylabel("rel L2 diff")
-    plt.title("Temporal pattern sensitivity")
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, "temporal_pattern_sensitivity.png"))
-    plt.close()
-
-    with open(os.path.join(outdir, "temporal_pattern_sensitivity.txt"), "w") as f:
-        for k,v in vals.items():
-            f.write(f"{k}: {v:.6f}\n")
-
-    return vals
-
 class UNet(nn.Module):
     def __init__(self, base_dim=128, dim_mults=(1,2,4),
                  in_channels=1+20, image_size=(H,W), dropout=0.0, groups=32):
@@ -1178,7 +1044,7 @@ class UNet(nn.Module):
         )
 
         # NEW MLP Mixer
-        
+        '''
         self.pre_mixer = PreUNetMLPMixer(
             T=self.T,
             H=self.image_h,
@@ -1193,7 +1059,7 @@ class UNet(nn.Module):
             use_tau_bias=True,       # temporal index bias 같이 쓰고 싶으면 True
             tau_emb_dim=base_dim,
         )
-        
+        '''
 
         # NEW Attention Mixer
         self.pre_attn_temporal = PreUNetTemporalAttnMixer(
@@ -1208,18 +1074,14 @@ class UNet(nn.Module):
         #     nn.Linear(self.time_dim, self.time_dim)
         # )
         self.time_mlp = TimeMLP(base_dim)
-        self.init = nn.Conv2d(in_channels, base_dim, 3, padding=1) # original init -> 서로 다른 filter가 학습 time에 대한 가정과 맞지 않음 이전에 proj
-        self.init_keep = nn.Conv2d(base_dim, base_dim, 3, padding=1) # NEW TCN Mixer
-        # self.init = nn.Identity() # NEW Atten Mixer -> Identity로 변경 실험? 아예 UNet이 아니라 데이터를 작게 하고 Attention/Transformer 계열
-        # 정우쌤의 COnvTrans / 아예 Transformer -> AddON 느낌으로
+        # self.init = nn.Conv2d(in_channels, base_dim, 3, padding=1) # original init
+        # self.init = nn.Conv2d(base_dim, base_dim, 3, padding=1) # NEW TCN Mixer
+        # self.init = nn.Identity() # NEW Atten Mixer
 
-        # 1. 아예 대체하는 것 (ViT 같은 느낌)
-        # 2. Time dimension -> self.inti 같은 것도 GRU / ConvLSTM 같은 모듈로 바꾸어서 실험
-        # 3. Conv 지날 떄의 데이터 분포 확인
+        c_in = in_channels // 2
+        self.init_noisy = nn.Conv2d(c_in, base_dim, 3, padding=1)
+        self.init_cond  = nn.Conv2d(c_in, base_dim, 3, padding=1)
 
-        # TODO : 조금 더 뭔가 direct한 prblem이 어디에 있는지
-        # COnventioanl한 trick이라기보다는 문제가 있는 상황
-        # Space와 Temporal 간의 차이를 확이날 수 있는 실험 구상 -> 이거 먼저 문제 찾아보기
 
         self.downs = nn.ModuleList()
         in_ch = base_dim
@@ -1230,13 +1092,30 @@ class UNet(nn.Module):
                 use_lstm = (li == 0)
             else:
                 use_lstm = False
-            rb1 = ResnetBlock(in_ch, out_ch, self.time_dim, dropout, groups,); self.downs.append(rb1); in_ch = out_ch; skip_channels.append(in_ch)
-            rb2 = ResnetBlock(in_ch, out_ch, self.time_dim, dropout, groups,); self.downs.append(rb2); in_ch = out_ch; skip_channels.append(in_ch)
+            # rb1 = ResnetBlock(in_ch, out_ch, self.time_dim, dropout, groups,); self.downs.append(rb1); in_ch = out_ch; skip_channels.append(in_ch)
+            # rb2 = ResnetBlock(in_ch, out_ch, self.time_dim, dropout, groups,); self.downs.append(rb2); in_ch = out_ch; skip_channels.append(in_ch)
+            
+            rb1 = ResnetBlock_STAttn2D(
+                in_ch, out_ch, self.time_dim, dropout, groups,
+                T=self.T, d_model=64, heads=4, dim_head=32,
+                use_temporal_attn=True, use_spatial_attn=True
+            )
+            self.downs.append(rb1); in_ch = out_ch; skip_channels.append(in_ch)
+
+            rb2 = ResnetBlock_STAttn2D(
+                in_ch, out_ch, self.time_dim, dropout, groups,
+                T=self.T, d_model=64, heads=4, dim_head=32,
+                use_temporal_attn=True, use_spatial_attn=True
+            )
+            self.downs.append(rb2); in_ch = out_ch; skip_channels.append(in_ch)
             if li != len(dim_mults) - 1:
                 self.downs.append(nn.Conv2d(in_ch, in_ch, 3, stride=2, padding=1))
 
-        self.mid1 = ResnetBlock(in_ch, in_ch, self.time_dim, dropout, groups,)
-        self.mid2 = ResnetBlock(in_ch, in_ch, self.time_dim, dropout, groups,)
+        # self.mid1 = ResnetBlock(in_ch, in_ch, self.time_dim, dropout, groups,)
+        # self.mid2 = ResnetBlock(in_ch, in_ch, self.time_dim, dropout, groups,)
+
+        self.mid1 = ResnetBlock_STAttn2D(in_ch, in_ch, self.time_dim, dropout, groups, T=self.T, d_model=64, heads=4, dim_head=32, use_spatial_attn=True)
+        self.mid2 = ResnetBlock_STAttn2D(in_ch, in_ch, self.time_dim, dropout, groups, T=self.T, d_model=64, heads=4, dim_head=32, use_spatial_attn=True)
 
         self.ups, self.kinds = nn.ModuleList(), []
         sc = skip_channels.copy()
@@ -1251,7 +1130,11 @@ class UNet(nn.Module):
 
             for _ in range(2):
                 skip_ch = sc.pop()
-                self.ups.append(ResnetBlock(in_ch + skip_ch, out_ch, self.time_dim, dropout, groups,)); self.kinds.append('res')
+                # self.ups.append(ResnetBlock(in_ch + skip_ch, out_ch, self.time_dim, dropout, groups,)); self.kinds.append('res')
+                self.ups.append(
+                    ResnetBlock_STAttn2D(in_ch + skip_ch, out_ch, self.time_dim, dropout, groups, T=self.T, d_model=64, heads=4, dim_head=32, use_spatial_attn=True)
+                )
+                self.kinds.append('res')
                 in_ch = out_ch
             if li != len(dim_mults) - 1:
                 self.ups.append(nn.Upsample(scale_factor=2, mode='nearest')); self.kinds.append('up')
@@ -1272,39 +1155,16 @@ class UNet(nn.Module):
         # x_cat = self.pre_mixer(x_cat)
 
         # NEW Attn Mixer
-        x_cat = self.pre_attn_temporal(x_cat)
-
-        if params.unetinit_debug:
-            _save_tensor_debug("before_init", x_cat)
+        # x_cat = self.pre_attn_temporal(x_cat)
         
         t_emb = self.time_mlp(t)
-        skips, h = [], self.init_keep(x_cat)
-
-        if params.unetinit_debug:
-            _save_tensor_debug("after_init", h)
-
-            make_init = lambda x: self.init(x)
-            make_premixer_init = lambda x: self.init_keep(self.pre_mixer(x))
-            make_premixer = lambda x: self.pre_mixer(x)
-
-            # import pdb;pdb.set_trace()
-            
-            viz_time_shuffle_sensitivity(make_init, x_cat, outdir="debug_time/init_only")
-            viz_tau_impulse_fingerprint(make_init, x_cat, outdir="debug_time/init_only")
-            viz_temporal_pattern_sensitivity(make_init, x_cat, outdir="debug_time/init_only")
-
-            viz_time_shuffle_sensitivity(make_premixer_init, x_cat, outdir="debug_time/mlppremix_and_init")
-            viz_tau_impulse_fingerprint(make_premixer_init, x_cat, outdir="debug_time/mlppremix_and_init")
-            viz_temporal_pattern_sensitivity(make_premixer_init, x_cat, outdir="debug_time/mlppremix_and_init")
-
-            viz_time_shuffle_sensitivity(make_premixer, x_cat, outdir="debug_time/mlppremix_only")
-            viz_tau_impulse_fingerprint(make_premixer, x_cat, outdir="debug_time/mlppremix_only")
-            viz_temporal_pattern_sensitivity(make_premixer, x_cat, outdir="debug_time/mlppremix_only")
-            
-            exit()
-            
+        x_noisy, x_cond = x_cat.chunk(2, dim=1)
+        h = self.init_noisy(x_noisy) + self.init_cond(x_cond)
+        # import pdb;pdb.set_trace()
+        skips = []
+        # skips, h = [], self.init(x_cat)
         for layer in self.downs:
-            if isinstance(layer, ResnetBlock):
+            if isinstance(layer, ResnetBlock_STAttn2D):
                 h = layer(h, t_emb); skips.append(h)
             else:
                 h = layer(h)
@@ -1333,15 +1193,6 @@ class GaussianDiffusion(nn.Module):
         self.H, self.W = image_size
         self.T = time_steps
         self.loss_type = loss_type
-
-        # Perceptual feature extractor (only created if needed)
-        if params.use_perceptual_loss:
-            self.feature_extractor = EEGFeatureExtractor(in_channels=50)
-            # Freeze feature extractor (optional: can train or freeze)
-            for param in self.feature_extractor.parameters():
-                param.requires_grad = False
-        else:
-            self.feature_extractor = None
 
         beta  = self.linear_beta_schedule(time_steps)
         alpha = 1. - beta
@@ -1402,63 +1253,7 @@ class GaussianDiffusion(nn.Module):
             raw = F.smooth_l1_loss(noise, pred, reduction='none')
 
         w = mask + params.be_weight  # supervise observed bins + tiny everywhere
-
-        loss = (raw * w).sum() / (w.sum() + 1e-8)
-
-        # Auxiliary losses (all require x0 reconstruction) by YT
-        if params.use_wavelet_loss or params.use_spectral_loss or params.use_perceptual_loss:
-            # Reconstruct x0 (hat_x0) from x_t and predicted noise
-            # x0_hat = (x_t - sqrt(1-abar) * pred) / sqrt(abar)
-            c1 = self.sqrt_recip_alpha_bar[t][:, None, None, None]
-            c2 = self.sqrt_recip_alpha_bar_min_1[t][:, None, None, None]
-            x0_hat = c1 * x_t - c2 * pred
-
-        # Wavelet Loss
-        if params.use_wavelet_loss:
-            # Multi-level Wavelet Loss
-            l_wavelet = 0.0
-            curr_gt, curr_hat = x0, x0_hat
-
-            # Decompose up to 3 levels (or until time dimension is too small)
-            for _ in range(1): # FIXME : original loop is 3, but to stablity ty change 1
-                if curr_gt.shape[1] < 2: break # Time dim is dim 1 now (B,T,H,W)
-
-                a_gt, d_gt = simple_haar_dwt_1d(curr_gt, dim=1)
-                a_hat, d_hat = simple_haar_dwt_1d(curr_hat, dim=1)
-
-                # import pdb;pdb.set_trace()
-                # Loss on detail coefficients (high freq at this scale)
-                diff_map = (d_gt - d_hat).pow(2)
-                l_wavelet += (diff_map * w).sum() / (w.sum() + 1e-8)
-
-                # Prepare approximation for next level
-                curr_gt, curr_hat = a_gt, a_hat
-
-            # Add loss on the final approximation (lowest freq)
-            diff_map = (curr_gt - curr_hat).pow(2)
-            l_wavelet += (diff_map * w).sum() / (w.sum() + 1e-8)
-
-            loss = loss + params.wavelet_loss_weight * l_wavelet
-
-        # Spectral Loss (FFT-based)
-        if params.use_spectral_loss:
-            if x0.shape[1] >= 2:  # Need at least 2 time points for FFT
-                # Compute spectral loss
-                spec_loss_map = spectral_loss_1d(x0, x0_hat, dim=1)
-                # Apply mask
-                l_spectral = (spec_loss_map * w).sum() / (w.sum() + 1e-8)
-                loss = loss + params.spectral_loss_weight * l_spectral
-
-        # Perceptual Loss (feature-based)
-        if params.use_perceptual_loss and self.feature_extractor is not None:
-            # Move feature extractor to same device if needed
-            if next(self.feature_extractor.parameters()).device != x0.device:
-                self.feature_extractor = self.feature_extractor.to(x0.device)
-
-            l_perceptual = perceptual_loss_2d(x0, x0_hat, self.feature_extractor, mask=mask)
-            loss = loss + params.perceptual_loss_weight * l_perceptual
-
-        return loss
+        return (raw * w).sum() / (w.sum() + 1e-8)
 
     @torch.inference_mode()
     def p_sample(self, xt, cond, t, clip=True):
@@ -1987,7 +1782,6 @@ def overlay_panel(
     plt.close(fig)
     print("Saved 1-inst overlay to:", save_path)
 
-
 import os, math
 import numpy as np
 import matplotlib.pyplot as plt
@@ -2126,7 +1920,7 @@ def load_and_eval(ckpt_path, test_loader):
     diff.eval()
 
     # rmse_raw, rmse_norm, nobs = eval_rmse(diff, test_loader) # FIXME : original eval code
-    rmse_raw, rmse_norm, nobs = eval_rmse_with_pbar(diffusion, test_loader, max_batches=1000, show_pbar=True)
+    rmse_raw, rmse_norm, nobs = eval_rmse_with_pbar(diffusion, test_loader, max_batches=500, show_pbar=True)
     # rmse_raw, rmse_norm, nobs = eval_rmse_minibatch(diff, test_loader, max_batches=2)
     # print(f"[BEST] Test RMSE_raw={rmse_raw:.3f} µg/m³ | RMSE_norm={rmse_norm:.3f} (over {nobs} bins)")
     print(f"[BEST] Test RMSE_raw={rmse_raw:.3f} µV (over {nobs} bins)")
